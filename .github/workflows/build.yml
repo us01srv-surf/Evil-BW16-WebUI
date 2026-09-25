@@ -1,0 +1,46 @@
+name: Build BW16 firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-bw16:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install Realtek AmebaD core
+        run: |
+          arduino-cli config add board_manager.additional_urls \
+            https://github.com/ambiot/ambd_arduino/raw/master/Arduino_package/package_realtek_amebad_index.json
+          arduino-cli core update-index
+          arduino-cli core install realtek:AmebaD
+
+      - name: Compile Evil-BW16 sketch
+        run: |
+          arduino-cli compile \
+            --fqbn realtek:AmebaD:Ai-Thinker_BW16 \
+            --warnings default \
+            --export-binaries \
+            Evil-BW16
+
+      - name: Collect flash image
+        run: |
+          find Evil-BW16 -name 'km0_km4_image2.bin' -print -exec cp {} fw-km0_km4_image2.bin \;
+          ls -la fw-km0_km4_image2.bin
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bw16-firmware
+          path: fw-km0_km4_image2.bin
+          if-no-files-found: error
