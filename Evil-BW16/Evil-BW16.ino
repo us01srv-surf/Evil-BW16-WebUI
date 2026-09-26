@@ -186,6 +186,11 @@ struct WiFiStationResult {
   short rssi;
 };
 
+// Forward declarations for functions taking the structs above
+// (prevents the Arduino sketch preprocessor from generating a
+// prototype before the type is defined)
+void sortByChannel(std::vector<WiFiScanResult> &results);
+
 // =========================
 // 802.11 Header Structure
 // =========================
@@ -556,6 +561,13 @@ unsigned long disassoc_interval = 1000;   // Interval in ms
 unsigned long last_disassoc_attack = 0;
 
 //==========================================================
+// Attack State Variables
+//==========================================================
+bool attack_enabled = false;
+bool scan_enabled   = false;
+bool target_mode    = false;
+
+//==========================================================
 // Raw Frame Injection
 //==========================================================
 void wifi_tx_raw_frame(void* frame, size_t length) {
@@ -755,13 +767,6 @@ void printScanResults() {
   
   sendResponse("[INFO] Scan results printed.");
 }
-
-//==========================================================
-// Attack State Variables
-//==========================================================
-bool attack_enabled = false;
-bool scan_enabled   = false;
-bool target_mode    = false;
 
 //==========================================================
 // Timed Attack

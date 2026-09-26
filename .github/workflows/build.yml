@@ -33,6 +33,22 @@ jobs:
             --build-path "$GITHUB_WORKSPACE/build" \
             Evil-BW16
 
+      - name: Dump preprocessed sketch on failure
+        if: failure()
+        run: |
+          echo "=== sketch files in build dir ==="
+          find build -name '*.ino.cpp' -o -name '*.cpp' | head -20 || true
+          INOCPP=$(find build -name 'Evil-BW16.ino.cpp' | head -1)
+          if [ -n "$INOCPP" ]; then
+            echo "=== first 80 lines of $INOCPP (prototype placement) ==="
+            sed -n '1,80p' "$INOCPP"
+            echo "=== grep WiFiScanResult/sortByChannel/attack_enabled in $INOCPP ==="
+            grep -n 'WiFiScanResult\|sortByChannel\|attack_enabled' "$INOCPP" | head -60 || true
+          else
+            echo "no generated ino.cpp found"
+            ls -laR build 2>/dev/null | head -80 || true
+          fi
+
       - name: Collect flash image
         run: |
           find build -name 'km0_km4_image2.bin' -print -exec cp {} fw-km0_km4_image2.bin \;
