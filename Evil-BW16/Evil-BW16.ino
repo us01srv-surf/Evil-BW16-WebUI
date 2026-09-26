@@ -541,6 +541,7 @@ void wifi_tx_disassoc_frame(const void* src_mac, const void* dst_mac, uint16_t r
 int scanNetworks();
 void printScanResults();
 void handleCommand(String command);
+void enterDownloadMode();
 void targetAttack();
 void generalAttack();
 void attackCycle();
@@ -891,7 +892,8 @@ bool isValidCommand(const String& command) {
     "sniff probe", "sniff deauth", "sniff eapol", "sniff pwnagotchi",
     "sniff all", "stop sniff", "hop on", "hop off", "set ch", "set ",
     "info", "help", "toggle_debug", "debug on", "debug off", "status",
-    "ble scan", "ble spam on", "ble spam off", "ble stop"
+    "ble scan", "ble spam on", "ble spam off", "ble stop",
+    "download", "reboot uartburn"
   };
   
   // Check if command starts with any valid command
@@ -1401,6 +1403,9 @@ void handleCommand(String command) {
     sendResponse("[INFO]  - info                 : Display the current configuration.");
     sendResponse("[INFO]  - status               : Display current system status.");
     sendResponse("[INFO]  - help                 : Display this help message.");
+    sendResponse("[INFO] System Commands:");
+    sendResponse("[INFO]  - download             : Reboot into ROM UART download mode (for flashing).");
+    sendResponse("[INFO]  - reboot uartburn      : Alias for 'download'.");
   }
   else if (command.equalsIgnoreCase("toggle_debug")) {
     DEBUG_MODE = !DEBUG_MODE;
@@ -1422,6 +1427,11 @@ void handleCommand(String command) {
     sendResponse("[INFO] - Disassoc Enabled: " + String(disassoc_enabled ? "Yes" : "No"));
     sendResponse("[INFO] - Is Sniffing: " + String(isSniffing ? "Yes" : "No"));
     sendResponse("[INFO] - Is Hopping: " + String(isHopping ? "Yes" : "No"));
+  }
+  else if (command.equalsIgnoreCase("download") ||
+           command.equalsIgnoreCase("reboot uartburn")) {
+    // Software entry into ROM flashloader (replaces stock AT+SETDOWNLOADMODE=1)
+    enterDownloadMode();
   }
   else {
     sendResponse("[ERROR] Unknown command. Type 'help' for a list of commands.");
@@ -1502,6 +1512,36 @@ void attackCycle() {
     delay(25);
   }
   sendResponse("[INFO] Attack cycle completed.");
+}
+
+//==========================================================
+// Software Download Mode (ROM flashloader entry)
+//==========================================================
+// NOTE: keep these helpers BELOW all includes/type definitions (struct
+// WiFiScanResult, std::vector): Arduino ctags injects prototypes before the
+// first function definition, and helpers placed at the top made those
+// prototypes fail to parse (same CI breakage seen in BW16-Pentest 12c749e).
+//
+// ROM BKUP APIs live in C-linkage; declare only NVIC_SystemReset here.
+// BKUP_Set is already declared by the SDK headers (a local decl conflicts).
+extern "C" {
+  void NVIC_SystemReset(void);
+}
+// BKUP_REG0 bit9 = SW set before reboot for uart download (rtl8721d_backup_reg.h)
+#ifndef BIT_UARTBURN_BOOT
+#define BIT_UARTBURN_BOOT (1u << 9)
+#endif
+
+// Set uart-burn boot flag and reset into ROM download mode
+// (software equivalent of stock AT+SETDOWNLOADMODE=1, which this firmware replaces)
+void enterDownloadMode() {
+  sendResponse("[INFO] Entering UART download mode...");
+  Serial.flush();
+  Serial1.flush();
+  delay(50);
+  BKUP_Set(0, BIT_UARTBURN_BOOT);
+  NVIC_SystemReset();
+  for (;;) {}
 }
 
 //==========================================================
