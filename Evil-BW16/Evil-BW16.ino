@@ -613,6 +613,10 @@ void wifi_tx_disassoc_frame(const void* src_mac, const void* dst_mac, uint16_t r
 int scanNetworks();
 void printScanResults();
 void handleCommand(String command);
+// Manual prototypes (used by promisc_callback before their definitions;
+// arduino's auto-prototype pass can fail on large sketch headers)
+bool isPwnagotchiMac(const uint8_t *mac);
+bool isEAPOL(const uint8_t *buf, int len);
 void enterDownloadMode();
 void targetAttack();
 void generalAttack();
@@ -1930,7 +1934,9 @@ void loop() {
           }
           frame += "\"}";
           for (int k = 0; k < nc; k++) {
-            ws_server_direct_sendText(frame.c_str(), (int)frame.length(), 0, conns[k]);
+            // direct_sendText takes char* (non-const); it memcpy's to its
+            // own txbufs, so casting the const away is safe here.
+            ws_server_direct_sendText((char *)frame.c_str(), (int)frame.length(), 0, conns[k]);
           }
         }
         start = i + 1;
