@@ -1657,9 +1657,11 @@ void setup() {
     int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
                                 channelStr, HIDDEN_AP ? 1 : 0);
     if (apStatus == WL_CONNECTED) {
+      IPAddress apIP = WiFi.localIP();   // AmebaD IPAddress has no toString()
       sendResponse("[INFO] AP started. SSID: " + String(WIFI_SSID) +
                    ", channel: " + String(WIFI_CHANNEL) +
-                   ", IP: " + WiFi.localIP().toString());
+                   ", IP: " + String(apIP[0]) + "." + String(apIP[1]) +
+                   "." + String(apIP[2]) + "." + String(apIP[3]));
     } else {
       sendResponse("[ERROR] AP start failed (WiFi.apbegin)");
     }
