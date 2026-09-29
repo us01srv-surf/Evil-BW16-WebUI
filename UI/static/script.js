@@ -379,7 +379,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     // Initialize WebSocket connection
-    uartConnection = new WebSocket(`ws://${window.location.hostname}/ws`);
+    uartConnection = new WebSocket(`ws://${window.location.hostname}:81/ws`);
 
     // Setup WebSocket event handlers
     uartConnection.onopen = () => {
@@ -1686,7 +1686,7 @@ function createAttackVisualization() {
 // Initialize WebSocket connection
 function initUART() {
     // Initialize WebSocket connection
-    uartConnection = new WebSocket(`ws://${window.location.hostname}/ws`);
+    uartConnection = new WebSocket(`ws://${window.location.hostname}:81/ws`);
 
     // Setup WebSocket event handlers
     uartConnection.onopen = () => {
