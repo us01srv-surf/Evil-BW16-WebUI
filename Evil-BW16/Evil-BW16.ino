@@ -41,6 +41,13 @@
 #include "BLEBeacon.h"
 #include <WDT.h>   // factory cmd_reboot pattern: watchdog backstop for download-mode reset
 
+// WebUI WebSocket bridge: Realtek's WS server (lib_websocket.a is linked
+// --whole-archive into every AmebaD sketch; header reachable via the
+// component/common/network include root). SDK headers are C -> extern "C".
+extern "C" {
+#include <websocket/wsserver_api.h>
+}
+
 // Undefine any existing min/max macros to prevent conflicts
 #ifdef min
 #undef min
@@ -59,6 +66,14 @@
 bool USE_LED = true;
 bool DEBUG_MODE = false;  // Debug mode flag
 bool HIDDEN_AP = false;   // Set to true for hidden AP, false for visible AP
+
+//==========================
+// WebUI WebSocket server (step 2 of the WebUI port: control channel only,
+// static HTTP files come in step 3 on port 80)
+//==========================
+static bool webuiRunning = false;
+#define WEBUI_WS_PORT     81   // UI opens ws://<host>:81/ws (script.js edit in step 3)
+#define WEBUI_WS_MAXCONN  2    // keep <= MEMP_NUM_NETCONN headroom
 
 //==========================
 // RGB Status LED layer
@@ -294,6 +309,36 @@ void sendResponse(const String& response) {
                 Serial1.print("\n");
             }
             Serial1.flush();
+        }
+    }
+
+    // WebUI WebSocket mirror: same lines as the serial consoles (raw text
+    // frames for now; step 3 wraps them in {"type":"serial_data"...} JSON)
+    if (webuiRunning) {
+        static unsigned long lastWSSend = 0;
+        static uint8_t wsBurst = 64;
+        unsigned long wsElapsed = currentTime - lastWSSend;
+        if (wsElapsed >= 25) {
+            unsigned long wsRefill = wsElapsed / 25;
+            lastWSSend = currentTime - (wsElapsed % 25);
+            if (wsRefill >= 64 || wsBurst + wsRefill > 64) {
+                wsBurst = 64;
+            } else {
+                wsBurst = (uint8_t)(wsBurst + wsRefill);
+            }
+        }
+        if (wsBurst > 0) {
+            wsBurst--;
+            String out = response;
+            if (!out.endsWith("\n")) {
+                out += "\n";
+            }
+            for (int i = 0; i < WEBUI_WS_MAXCONN; i++) {
+                ws_conn *c = ws_server_get_conn_info(i);
+                if (c != NULL && (c->state == CONNECTED1 || c->state == CONNECTED2)) {
+                    ws_server_sendText((char *)out.c_str(), (int)out.length(), 0, c);
+                }
+            }
         }
     }
 }
@@ -920,7 +965,7 @@ bool isValidCommand(const String& command) {
     "sniff all", "stop sniff", "hop on", "hop off", "set ch", "set ",
     "info", "help", "toggle_debug", "debug on", "debug off", "status",
     "ble scan", "ble spam on", "ble spam off", "ble stop",
-    "download", "reboot uartburn"
+    "download", "reboot uartburn", "webui "
   };
   
   // Check if command starts with any valid command
@@ -931,6 +976,48 @@ bool isValidCommand(const String& command) {
   }
   
   return false;
+}
+
+//==========================================================
+// WebUI WebSocket bridge (Realtek lib_websocket.a)
+//==========================================================
+// Copy a received frame payload out of conn->receivedData (not guaranteed
+// NUL-terminated) and run it through the same handleCommand() the UART
+// paths use. Accepts both raw command lines (spike/tests) and the ESP32
+// UI JSON: {"action":"send_command","command":"<line>"}.
+static void webuiWsDispatch(ws_conn *conn, int data_len, enum opcode_type opcode) {
+    if (opcode != TEXT_FRAME || conn == NULL || conn->receivedData == NULL || data_len <= 0) {
+        return;
+    }
+    char buf[256];
+    int n = (data_len < (int)sizeof(buf) - 1) ? data_len : (int)sizeof(buf) - 1;
+    memcpy(buf, conn->receivedData, n);
+    buf[n] = '\0';
+    String msg(buf);
+    msg.trim();
+    if (msg.length() == 0) {
+        return;
+    }
+    String command = msg;
+    if (msg.startsWith("{")) {
+        // {"action":"send_command","command":"<line>"} - ESP32 UI wire format
+        int key = msg.indexOf("\"command\"");
+        if (key < 0) {
+            return;
+        }
+        int colon = msg.indexOf(':', key);
+        int open = (colon >= 0) ? msg.indexOf('"', colon + 1) : -1;
+        int close = (open >= 0) ? msg.indexOf('"', open + 1) : -1;
+        if (open < 0 || close < 0) {
+            return;
+        }
+        command = msg.substring(open + 1, close);
+        command.trim();
+    }
+    if (command.length() == 0) {
+        return;
+    }
+    handleCommand(command);
 }
 
 //==========================================================
@@ -1459,6 +1546,33 @@ void handleCommand(String command) {
            command.equalsIgnoreCase("reboot uartburn")) {
     // Software entry into ROM flashloader (replaces stock AT+SETDOWNLOADMODE=1)
     enterDownloadMode();
+  }
+  else if (command.equalsIgnoreCase("webui on")) {
+    if (webuiRunning) {
+      sendResponse("[INFO] WebUI WS already running on port " + String(WEBUI_WS_PORT));
+    } else {
+      ws_server_setup_tx_rx_size(2048, 512);   // default 256B tx is too small
+      ws_server_setup_debug(WS_SERVER_DEBUG_OFF);
+      ws_server_dispatch(webuiWsDispatch);
+      int wsret = ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
+                                  WS_SERVER_SECURE_NONE);
+      if (wsret == 0) {
+        webuiRunning = true;
+        sendResponse("[INFO] WebUI WS server started: ws://<device-ip>:" +
+                     String(WEBUI_WS_PORT) + "/ws");
+      } else {
+        sendResponse("[ERROR] ws_server_start failed (" + String(wsret) + ")");
+      }
+    }
+  }
+  else if (command.equalsIgnoreCase("webui off")) {
+    if (webuiRunning) {
+      ws_server_stop();
+      webuiRunning = false;
+      sendResponse("[INFO] WebUI WS server stopped");
+    } else {
+      sendResponse("[INFO] WebUI WS server is not running");
+    }
   }
   else {
     sendResponse("[ERROR] Unknown command. Type 'help' for a list of commands.");
