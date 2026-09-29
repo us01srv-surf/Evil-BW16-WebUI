@@ -39,6 +39,7 @@
 #include "platform_stdlib.h"
 #include "BLEDevice.h"
 #include "BLEBeacon.h"
+#include <WDT.h>   // factory cmd_reboot pattern: watchdog backstop for download-mode reset
 
 // Undefine any existing min/max macros to prevent conflicts
 #ifdef min
@@ -1534,13 +1535,42 @@ extern "C" {
 
 // Set uart-burn boot flag and reset into ROM download mode
 // (software equivalent of stock AT+SETDOWNLOADMODE=1, which this firmware replaces)
+//
+// History: v1 used BKUP_Set + NVIC_SystemReset and HUNG the loop task on hardware
+// (probes 10/12/13/14: echo seen, no reset, no ROM, app dead until close-reopen).
+// v2: arm WDG first (factory cmd_reboot pattern from monitor_hp.c) so ANY hang
+// still ends in a system reset; write BKUP_REG0 bit9 by direct MMIO (same
+// register/offset the boot ROM reads: REG_LP_BOOT_REASON0 @ SYSTEM_CTRL_BASE_LP+0x3C0)
+// instead of the hanging ROM BKUP_Set; markers use raw Serial.write to bypass
+// sendResponse's 25ms rate limiter.
 void enterDownloadMode() {
-  sendResponse("[INFO] Entering UART download mode...");
-  Serial.flush();
-  Serial1.flush();
-  delay(50);
-  BKUP_Set(0, BIT_UARTBURN_BOOT);
+  // 1) Watchdog backstop: default action = system reset; backup regs survive it.
+  {
+    WDT wdt;
+    wdt.InitWatchdog(500);   // ms - bite if BKUP MMIO or NVIC_SystemReset hangs
+    wdt.StartWatchdog();
+  }
+  Serial.write("[DM1] wdg armed\n");
+  delay(10);                 // let marker drain (delay chain verified: scan's delay(5000))
+
+  // 2) Set BKUP_REG0 bit9 (BIT_UARTBURN_BOOT) directly.
+  volatile uint32_t* bkup_reg0 = (volatile uint32_t*)0x480003C0;
+  *bkup_reg0 = (*bkup_reg0) | BIT_UARTBURN_BOOT;
+  uint32_t rb = *bkup_reg0;
+  Serial.write((rb & BIT_UARTBURN_BOOT) ? "[DM2] bit9=1\n" : "[DM2] bit9=0\n");
+  delay(10);
+
+  if (!(rb & BIT_UARTBURN_BOOT)) {
+    // Direct write did not land - last resort: original ROM path
+    BKUP_Set(0, BIT_UARTBURN_BOOT);
+    Serial.write("[DM3] BKUP_Set returned\n");
+    delay(10);
+  }
+
+  // 3) Reset (if this hangs, the watchdog bites in <500ms and boots ROM anyway)
   NVIC_SystemReset();
+  Serial.write("[DM4] NVIC_SystemReset RETURNED\n");
+  delay(100);
   for (;;) {}
 }
 
