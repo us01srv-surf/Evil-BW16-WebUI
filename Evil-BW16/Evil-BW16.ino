@@ -343,6 +343,12 @@ void sendResponse(const String& response) {
     }
 }
 
+// Manual prototypes: promisc_callback uses these before their definitions
+// (arduino's auto-prototype pass has failed on this sketch before - see note
+// above the BKUP declares - so don't rely on it for these two).
+bool isPwnagotchiMac(const uint8_t *mac);
+bool isEAPOL(const uint8_t *buf, int len);
+
 // =========================
 // Promiscuous Callback
 // =========================
@@ -613,10 +619,6 @@ void wifi_tx_disassoc_frame(const void* src_mac, const void* dst_mac, uint16_t r
 int scanNetworks();
 void printScanResults();
 void handleCommand(String command);
-// Manual prototypes (used by promisc_callback before their definitions;
-// arduino's auto-prototype pass can fail on large sketch headers)
-bool isPwnagotchiMac(const uint8_t *mac);
-bool isEAPOL(const uint8_t *buf, int len);
 void enterDownloadMode();
 void targetAttack();
 void generalAttack();
