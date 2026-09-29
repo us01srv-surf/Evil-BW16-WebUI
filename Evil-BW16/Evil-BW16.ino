@@ -1054,21 +1054,28 @@ static bool webuiStart(void) {
 // Bring the AP + WebUI transport back after a promisc transform (single radio:
 // sniffing/hopping kills beacons, netif and listen sockets). Called from
 // 'stop sniff' / 'hop off' - guards on apSuperseded so it is a no-op normally.
+extern uint8_t arduino_wifi_mode_check;   // wifi_drv.cpp global (wifi_drv.h)
 static void restoreApAndWebui(void) {
   if (!apSuperseded) return;
   apSuperseded = false;
   bool wantWs = webuiRunning;
-  // Release server sockets FIRST (frees the lwIP netconn pool), then a full
-  // wifi power-cycle: wifi_off() wipes the stale STA client table left by the
-  // mode transform ("Exceed the upper limit(5)" blocked every association)
-  // and any zombie PCBs, so apbegin() comes up identical to a fresh boot.
+  // Release server sockets FIRST (frees the lwIP netconn pool).
   if (wantWs) {
     ws_server_stop();
     webuiRunning = false;
   }
   httpServer.stop();
-  wifi_off();
-  delay(150);
+  // The Arduino wifi layer caches init_wlan/wifi_mode in file-static vars we
+  // can't reset - after a promisc transform + raw wifi_off its wifiDriverInit
+  // no-ops and apbegin's ioctl hits a DOWN netif. The only reachable lever is
+  // arduino_wifi_mode_check: pointing it at a DIFFERENT mode than the cached
+  // one forces the layer's own clean cycle (dhcps_deinit -> wifi_off ->
+  // wifi_on), which wipes the stale STA client table ("Exceed the upper
+  // limit(5)") and re-inits the driver. Toggle each restore so the target
+  // always differs from the cache left by the previous cycle.
+  static bool cycleHigh = false;
+  cycleHigh = !cycleHigh;
+  arduino_wifi_mode_check = cycleHigh ? 0x11 : 0x10;  // apbegin ORs 0x10
   char channelStr[8];
   snprintf(channelStr, sizeof(channelStr), "%d", WIFI_CHANNEL);
   int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
