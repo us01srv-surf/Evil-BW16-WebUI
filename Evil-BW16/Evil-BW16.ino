@@ -87,6 +87,10 @@ static char wsTxQ[4096];                 // pending bytes (drop-on-full)
 static volatile uint32_t wsTxQLen = 0;
 static char wsTxOut[4096];               // flush scratch (single-threaded: loop)
 WiFiServer httpServer(80);               // WebUI static asset server (global: _portMode zero-init = TCP)
+// Single-radio truth: wifi_on(PROMISC) supersedes the AP (beacons stop, netif
+// and the :80/:81 listeners die). Set whenever that happens; cleared when the
+// AP + servers are restored via restoreApAndWebui().
+static bool apSuperseded = false;
 
 //==========================
 // RGB Status LED layer
@@ -445,6 +449,7 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
 void setChannel(int newChannel) {
   if (!isSniffing) {
     // Need to initialize WiFi first
+    apSuperseded = true;
     wifi_on(RTW_MODE_PROMISC);
     wifi_enter_promisc_mode();
   }
@@ -499,6 +504,7 @@ void startSniffing() {
     sendResponse("[INFO] Enabling promiscuous mode...");
 
     // Initialize WiFi in PROMISC mode
+    apSuperseded = true;
     wifi_on(RTW_MODE_PROMISC);
     wifi_enter_promisc_mode();
     setChannel(currentChannel);
@@ -1045,6 +1051,38 @@ static bool webuiStart(void) {
   return false;
 }
 
+// Bring the AP + WebUI transport back after a promisc transform (single radio:
+// sniffing/hopping kills beacons, netif and listen sockets). Called from
+// 'stop sniff' / 'hop off' - guards on apSuperseded so it is a no-op normally.
+static void restoreApAndWebui(void) {
+  if (!apSuperseded) return;
+  apSuperseded = false;
+  char channelStr[8];
+  snprintf(channelStr, sizeof(channelStr), "%d", WIFI_CHANNEL);
+  int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
+                              channelStr, HIDDEN_AP ? 1 : 0);
+  if (apStatus == WL_CONNECTED) {
+    httpServer.stop();            // stale fd from before the wifi restart
+    httpServer.setNonBlockingMode();
+    httpServer.begin();
+    if (webuiRunning) {
+      ws_server_stop();           // dead listener from before the restart
+      webuiRunning = false;
+      if (!webuiStart()) {
+        sendResponse("[ERROR] WebUI WS restart failed");
+        return;
+      }
+    }
+    IPAddress apIP = WiFi.localIP();
+    sendResponse("[INFO] AP restored. WebUI: http://" +
+                 String(apIP[0]) + "." + String(apIP[1]) + "." +
+                 String(apIP[2]) + "." + String(apIP[3]) +
+                 "/ (ws :" + String(WEBUI_WS_PORT) + ")");
+  } else {
+    sendResponse("[ERROR] AP restore failed (WiFi.apbegin)");
+  }
+}
+
 //==========================================================
 // HTTP static asset server (:80) for the WebUI
 //==========================================================
@@ -1272,6 +1310,7 @@ void handleCommand(String command) {
   else if (command == "hop on") {
     isHopping = true;
     if (!isSniffing) {
+      apSuperseded = true;
       wifi_on(RTW_MODE_PROMISC);
       wifi_enter_promisc_mode();
     }
@@ -1280,14 +1319,17 @@ void handleCommand(String command) {
   else if (command == "hop off") {
     isHopping = false;
     sendResponse("[CMD] Channel hopping disabled");
+    if (!isSniffing) restoreApAndWebui();   // hop was the only AP consumer
   }
   else if (command.startsWith("set ch ") || command.startsWith("ch ")) {
-    // UI saveHopSettings sends bare `ch 1,6,11` (also `set ch ...` from CLI)
-    String chStr = command.startsWith("set ch ") ? command.substring(7)
-                                                 : command.substring(3);
+    // Bare `ch 1,6,11` (UI saveHopSettings) = CONFIG ONLY: record the list
+    // without touching the radio, so the WebUI connection survives.
+    // `set ch ...` (CLI) keeps the legacy immediate/hopping behaviour.
+    bool uiCfg = command.startsWith("ch ");
+    String chStr = uiCfg ? command.substring(3) : command.substring(7);
 
-    // Check if it's a comma-separated list
-    if (chStr.indexOf(',') != -1) {
+    // Check if it's a comma-separated list (uiCfg also accepts a bare single)
+    if (uiCfg || chStr.indexOf(',') != -1) {
       // Reset custom channels
       numCustomChannels = 0;
       useCustomChannels = false;
@@ -1324,14 +1366,25 @@ void handleCommand(String command) {
 
       if (numCustomChannels > 0) {
         useCustomChannels = true;
-        isHopping = true;
-        currentChannelIndex = 0;
-        currentChannel = customChannels[0];
-        setChannel(currentChannel);
-        sendResponse("[CMD] Set custom channel sequence: ");
-        for (int i = 0; i < numCustomChannels; i++) {
-          sendResponse(String(customChannels[i]) + (i < numCustomChannels - 1 ? "," : ""));
+        if (uiCfg) {
+          String saved;
+          for (int i = 0; i < numCustomChannels; i++) {
+            saved += String(customChannels[i]);
+            if (i < numCustomChannels - 1) saved += ",";
+          }
+          sendResponse("[CMD] Channel list saved: " + saved);
+        } else {
+          isHopping = true;
+          currentChannelIndex = 0;
+          currentChannel = customChannels[0];
+          setChannel(currentChannel);
+          sendResponse("[CMD] Set custom channel sequence: ");
+          for (int i = 0; i < numCustomChannels; i++) {
+            sendResponse(String(customChannels[i]) + (i < numCustomChannels - 1 ? "," : ""));
+          }
         }
+      } else {
+        sendResponse("[ERROR] Invalid channel list");
       }
     } else {
       // Single channel setting
@@ -1385,6 +1438,7 @@ void handleCommand(String command) {
   }
   else if (command == "stop sniff") {
     stopSniffing();
+    restoreApAndWebui();   // sniffer done -> bring WebUI transport back
   }
   //==========================
   // "set" Command (Existing)
