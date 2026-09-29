@@ -1841,7 +1841,7 @@ void setup() {
 // Serves the embedded gzipped assets (webui_assets.h). Server socket is
 // non-blocking (setNonBlockingMode before begin) so available() returns
 // immediately; the bounded request read only runs once a client connects.
-static void httpServerLoop(void) {
+static void webuiHttpPoll(void) {
   WiFiClient c = httpServer.available();
   if (!c.connected()) return;   // handles -1 -> 0xFF accept sentinel too
   String req;
@@ -1949,7 +1949,7 @@ void loop() {
   }
 
   // WebUI HTTP static server (bounded work: returns immediately when idle)
-  httpServerLoop();
+  webuiHttpPoll();
 
   // Handle commands from UART Serial
   if (Serial1.available()) {
