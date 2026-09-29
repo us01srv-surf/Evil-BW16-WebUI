@@ -329,12 +329,12 @@ void sendResponse(const String& response) {
             out += "\n";
         }
         int n = out.length();
-        rtos_enter_critical(NULL, NULL);
+        rtw_enter_critical(NULL, NULL);
         if (wsTxQLen + (uint32_t)n <= sizeof(wsTxQ)) {
             memcpy(wsTxQ + wsTxQLen, out.c_str(), n);
             wsTxQLen += (uint32_t)n;
         } // else: queue full -> drop line (same policy as flood token bucket)
-        rtos_exit_critical(NULL, NULL);
+        rtw_exit_critical(NULL, NULL);
     }
 }
 
@@ -1567,9 +1567,9 @@ void handleCommand(String command) {
     if (webuiRunning) {
       ws_server_stop();
       webuiRunning = false;
-      rtos_enter_critical(NULL, NULL);
+      rtw_enter_critical(NULL, NULL);
       wsTxQLen = 0;   // discard queued output - don't leak into next session
-      rtos_exit_critical(NULL, NULL);
+      rtw_exit_critical(NULL, NULL);
       sendResponse("[INFO] WebUI WS server stopped");
     } else {
       sendResponse("[INFO] WebUI WS server is not running");
@@ -1797,11 +1797,11 @@ void loop() {
   // the old last-line-only bug is documented at the wsTxQ declaration).
   if (webuiRunning && wsTxQLen > 0) {
     uint32_t n;
-    rtos_enter_critical(NULL, NULL);
+    rtw_enter_critical(NULL, NULL);
     n = wsTxQLen;
     memcpy(wsTxOut, wsTxQ, n);   // sizes equal (4096) -> n never exceeds
     wsTxQLen = 0;
-    rtos_exit_critical(NULL, NULL);
+    rtw_exit_critical(NULL, NULL);
 
     ws_conn *conns[WEBUI_WS_MAXCONN];
     int nc = 0;
