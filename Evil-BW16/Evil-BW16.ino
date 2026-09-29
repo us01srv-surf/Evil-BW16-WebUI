@@ -44,8 +44,11 @@
 // WebUI WebSocket bridge: Realtek's WS server (lib_websocket.a is linked
 // --whole-archive into every AmebaD sketch; header reachable via the
 // component/common/network include root). SDK headers are C -> extern "C".
+// osdep_service.h is NOT pulled by wsserver_api.h (core 3.1.9 master copy)
+// but is what declares rtw_enter/exit_critical (our queue's mutex).
 extern "C" {
 #include <websocket/wsserver_api.h>
+#include "osdep_service.h"
 }
 
 // Undefine any existing min/max macros to prevent conflicts
