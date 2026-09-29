@@ -1643,26 +1643,26 @@ void setup() {
     ledSet(1); // idle blue after boot animation
   }
 
-  if (HIDDEN_AP) {
-    sendResponse("[INFO] Initializing WiFi in hidden AP mode...");
-    wifi_on(RTW_MODE_AP);
-    wifi_start_ap_with_hidden_ssid(WIFI_SSID,
-                                   RTW_SECURITY_WPA2_AES_PSK,
-                                   WIFI_PASS,
-                                   11,   // keyID
-                                   18,   // SSID length
-                                   WIFI_CHANNEL);
-    sendResponse("[INFO] Hidden AP started. Selected channel: " + String(WIFI_CHANNEL));
-  } else {
-    sendResponse("[INFO] Initializing WiFi in visible AP mode...");
-    wifi_on(RTW_MODE_AP);
-    wifi_start_ap(WIFI_SSID,
-                  RTW_SECURITY_WPA2_AES_PSK,
-                  WIFI_PASS,
-                  strlen(WIFI_SSID),
-                  strlen(WIFI_PASS),
-                  WIFI_CHANNEL);
-    sendResponse("[INFO] Visible AP started. Selected channel: " + String(WIFI_CHANNEL));
+  // AP start via Arduino WiFi.apbegin() instead of raw wifi_start_ap():
+  // the raw SDK path only beacons the SSID - it never runs LwIP_Init(),
+  // netif_set_addr() or dhcps_init(), so the AP was L2-only (no IPv4
+  // address, no ARP replies, no DHCP server -> unreachable for WebUI).
+  // apbegin() -> apActivate() does all of that (AP IP 192.168.1.1/24)
+  // and also supports hidden SSID.
+  {
+    char channelStr[8];
+    snprintf(channelStr, sizeof(channelStr), "%d", WIFI_CHANNEL);
+    sendResponse(HIDDEN_AP ? "[INFO] Initializing WiFi in hidden AP mode..."
+                           : "[INFO] Initializing WiFi in visible AP mode...");
+    int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
+                                channelStr, HIDDEN_AP ? 1 : 0);
+    if (apStatus == WL_CONNECTED) {
+      sendResponse("[INFO] AP started. SSID: " + String(WIFI_SSID) +
+                   ", channel: " + String(WIFI_CHANNEL) +
+                   ", IP: " + WiFi.localIP().toString());
+    } else {
+      sendResponse("[ERROR] AP start failed (WiFi.apbegin)");
+    }
   }
 
   last_cycle = millis();
