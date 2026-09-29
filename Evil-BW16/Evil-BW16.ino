@@ -247,13 +247,26 @@ void sendResponse(const String& response) {
         return;
     }
 
-    // Rate limit to prevent overwhelming the system
+    // Rate limit: token bucket - sustains the same ~40 msg/s ceiling as the old
+    // drop-limiter, but a burst budget lets one-shot batches through intact
+    // (help=46 back-to-back lines, status/info/scan lists were all DROPPED before)
     static unsigned long lastSend = 0;
+    static uint8_t burstTokens = 64;
     unsigned long currentTime = millis();
-    if (currentTime - lastSend < 25) { // Minimum 25ms between sends
-        return;
+    unsigned long elapsed = currentTime - lastSend;
+    if (elapsed >= 25) {
+        unsigned long refill = elapsed / 25;
+        lastSend = currentTime - (elapsed % 25);
+        if (refill >= 64 || burstTokens + refill > 64) {
+            burstTokens = 64;
+        } else {
+            burstTokens = (uint8_t)(burstTokens + refill);
+        }
     }
-    lastSend = currentTime;
+    if (burstTokens == 0) {
+        return; // sustained flood: drop exactly like the old limiter
+    }
+    burstTokens--;
 
     // Send message directly to reduce memory usage
     Serial.print(response);
@@ -261,14 +274,27 @@ void sendResponse(const String& response) {
         Serial.print("\n");
     }
 
-    // UART with additional rate limiting
-    if (currentTime - lastUARTSend >= UART_MIN_INTERVAL) {
-        Serial1.print(response);
-        if (!response.endsWith("\n")) {
-            Serial1.print("\n");
+    // UART mirror with its own token bucket (50ms pacing)
+    {
+        static uint8_t uartBurst = 64;
+        unsigned long uElapsed = currentTime - lastUARTSend;
+        if (uElapsed >= UART_MIN_INTERVAL) {
+            unsigned long uRefill = uElapsed / UART_MIN_INTERVAL;
+            lastUARTSend = currentTime - (uElapsed % UART_MIN_INTERVAL);
+            if (uRefill >= 64 || uartBurst + uRefill > 64) {
+                uartBurst = 64;
+            } else {
+                uartBurst = (uint8_t)(uartBurst + uRefill);
+            }
         }
-        Serial1.flush();
-        lastUARTSend = currentTime;
+        if (uartBurst > 0) {
+            uartBurst--;
+            Serial1.print(response);
+            if (!response.endsWith("\n")) {
+                Serial1.print("\n");
+            }
+            Serial1.flush();
+        }
     }
 }
 
