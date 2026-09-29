@@ -74,6 +74,14 @@ bool HIDDEN_AP = false;   // Set to true for hidden AP, false for visible AP
 static bool webuiRunning = false;
 #define WEBUI_WS_PORT     81   // UI opens ws://<host>:81/ws (script.js edit in step 3)
 #define WEBUI_WS_MAXCONN  2    // keep <= MEMP_NUM_NETCONN headroom
+// sendResponse -> WS output queue. Poll-mode ws_server_sendText OVERWRITES
+// conn->txbuf (ws_server_msg.c:265-267) and dispatch runs inside the conn
+// task, so a multi-line burst collapsed to its last line. Fix: sendResponse
+// only appends here (critical-section memcpy); loop() is the SOLE socket
+// writer and uses direct_sendText (own buffer, immediate write).
+static char wsTxQ[4096];                 // pending bytes (drop-on-full)
+static volatile uint32_t wsTxQLen = 0;
+static char wsTxOut[4096];               // flush scratch (single-threaded: loop)
 
 //==========================
 // RGB Status LED layer
@@ -312,34 +320,21 @@ void sendResponse(const String& response) {
         }
     }
 
-    // WebUI WebSocket mirror: same lines as the serial consoles (raw text
-    // frames for now; step 3 wraps them in {"type":"serial_data"...} JSON)
+    // WebUI WebSocket queue: append only - loop() flushes via
+    // direct_sendText (poll-mode sendText overwrites txbuf -> last line only;
+    // see wsTxQ declaration for the full root cause).
     if (webuiRunning) {
-        static unsigned long lastWSSend = 0;
-        static uint8_t wsBurst = 64;
-        unsigned long wsElapsed = currentTime - lastWSSend;
-        if (wsElapsed >= 25) {
-            unsigned long wsRefill = wsElapsed / 25;
-            lastWSSend = currentTime - (wsElapsed % 25);
-            if (wsRefill >= 64 || wsBurst + wsRefill > 64) {
-                wsBurst = 64;
-            } else {
-                wsBurst = (uint8_t)(wsBurst + wsRefill);
-            }
+        String out = response;
+        if (!out.endsWith("\n")) {
+            out += "\n";
         }
-        if (wsBurst > 0) {
-            wsBurst--;
-            String out = response;
-            if (!out.endsWith("\n")) {
-                out += "\n";
-            }
-            for (int i = 0; i < WEBUI_WS_MAXCONN; i++) {
-                ws_conn *c = ws_server_get_conn_info(i);
-                if (c != NULL && (c->state == CONNECTED1 || c->state == CONNECTED2)) {
-                    ws_server_sendText((char *)out.c_str(), (int)out.length(), 0, c);
-                }
-            }
-        }
+        int n = out.length();
+        rtos_enter_critical(NULL, NULL);
+        if (wsTxQLen + (uint32_t)n <= sizeof(wsTxQ)) {
+            memcpy(wsTxQ + wsTxQLen, out.c_str(), n);
+            wsTxQLen += (uint32_t)n;
+        } // else: queue full -> drop line (same policy as flood token bucket)
+        rtos_exit_critical(NULL, NULL);
     }
 }
 
@@ -1553,6 +1548,9 @@ void handleCommand(String command) {
     } else {
       ws_server_setup_tx_rx_size(2048, 512);   // default 256B tx is too small
       ws_server_setup_debug(WS_SERVER_DEBUG_OFF);
+      // SDK ping (conn task, 2B/30s default) is the only other socket writer
+      // besides our loop()-task flusher - shrink the interleave window.
+      ws_server_setup_ping_interval(3600000);  // 1 h (0 semantics unverified)
       ws_server_dispatch(webuiWsDispatch);
       int wsret = ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
                                   WS_SERVER_SECURE_NONE);
@@ -1569,6 +1567,9 @@ void handleCommand(String command) {
     if (webuiRunning) {
       ws_server_stop();
       webuiRunning = false;
+      rtos_enter_critical(NULL, NULL);
+      wsTxQLen = 0;   // discard queued output - don't leak into next session
+      rtos_exit_critical(NULL, NULL);
       sendResponse("[INFO] WebUI WS server stopped");
     } else {
       sendResponse("[INFO] WebUI WS server is not running");
@@ -1792,6 +1793,39 @@ void setup() {
 // Main Loop
 //==========================================================
 void loop() {
+  // WebUI WS flush - the SOLE socket writer for our output (root cause of
+  // the old last-line-only bug is documented at the wsTxQ declaration).
+  if (webuiRunning && wsTxQLen > 0) {
+    uint32_t n;
+    rtos_enter_critical(NULL, NULL);
+    n = wsTxQLen;
+    memcpy(wsTxOut, wsTxQ, n);   // sizes equal (4096) -> n never exceeds
+    wsTxQLen = 0;
+    rtos_exit_critical(NULL, NULL);
+
+    ws_conn *conns[WEBUI_WS_MAXCONN];
+    int nc = 0;
+    for (int i = 0; i < WEBUI_WS_MAXCONN; i++) {
+      ws_conn *c = ws_server_get_conn_info(i);
+      if (c != NULL && (c->state == CONNECTED1 || c->state == CONNECTED2)) {
+        conns[nc++] = c;
+      }
+    }
+    if (nc > 0) {
+      for (int k = 0; k < nc; k++) {
+        uint32_t off = 0;
+        while (off < n) {
+          uint32_t chunk = n - off;
+          if (chunk > 2048) chunk = 2048;  // direct_sendText rejects > tx_size
+          ws_server_direct_sendText(wsTxOut + off, (int)chunk, 0, conns[k]);
+          off += chunk;
+        }
+      }
+    }
+    // no connected client -> discard (no stale backlog, matches ESP32
+    // sendUartDataToClients skip when ws.count()==0)
+  }
+
   // Handle commands from UART Serial
   if (Serial1.available()) {
     String command = Serial1.readStringUntil('\n');
