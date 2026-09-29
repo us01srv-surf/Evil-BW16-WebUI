@@ -1057,21 +1057,28 @@ static bool webuiStart(void) {
 static void restoreApAndWebui(void) {
   if (!apSuperseded) return;
   apSuperseded = false;
+  bool wantWs = webuiRunning;
+  // Release server sockets FIRST (frees the lwIP netconn pool), then a full
+  // wifi power-cycle: wifi_off() wipes the stale STA client table left by the
+  // mode transform ("Exceed the upper limit(5)" blocked every association)
+  // and any zombie PCBs, so apbegin() comes up identical to a fresh boot.
+  if (wantWs) {
+    ws_server_stop();
+    webuiRunning = false;
+  }
+  httpServer.stop();
+  wifi_off();
+  delay(150);
   char channelStr[8];
   snprintf(channelStr, sizeof(channelStr), "%d", WIFI_CHANNEL);
   int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
                               channelStr, HIDDEN_AP ? 1 : 0);
   if (apStatus == WL_CONNECTED) {
-    httpServer.stop();            // stale fd from before the wifi restart
     httpServer.setNonBlockingMode();
     httpServer.begin();
-    if (webuiRunning) {
-      ws_server_stop();           // dead listener from before the restart
-      webuiRunning = false;
-      if (!webuiStart()) {
-        sendResponse("[ERROR] WebUI WS restart failed");
-        return;
-      }
+    if (wantWs && !webuiStart()) {
+      sendResponse("[ERROR] WebUI WS restart failed");
+      return;
     }
     IPAddress apIP = WiFi.localIP();
     sendResponse("[INFO] AP restored. WebUI: http://" +
