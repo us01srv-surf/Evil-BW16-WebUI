@@ -1046,6 +1046,64 @@ static bool webuiStart(void) {
 }
 
 //==========================================================
+// HTTP static asset server (:80) for the WebUI
+//==========================================================
+// Serves the embedded gzipped assets (webui_assets.h). Server socket is
+// non-blocking (setNonBlockingMode before begin) so available() returns
+// immediately; the bounded request read only runs once a client connects.
+static void webuiHttpPoll(void) {
+  WiFiClient c = httpServer.available();
+  if (!c.connected()) return;   // handles -1 -> 0xFF accept sentinel too
+  String req;
+  unsigned long t0 = millis();
+  bool got = false;
+  while (millis() - t0 < 1000) {
+    while (c.available()) {
+      char ch = (char)c.read();
+      req += ch;
+      if (req.endsWith("\r\n\r\n")) { got = true; break; }
+    }
+    if (got || !c.connected()) break;
+    delay(5);
+  }
+  if (got && req.startsWith("GET ")) {
+    int sp = req.indexOf(' ', 4);
+    String path = req.substring(4, (sp >= 0) ? sp : (int)req.length());
+    int q = path.indexOf('?');
+    if (q >= 0) path = path.substring(0, q);
+    if (path == "/") path = "/index.html";
+    const WebAsset *a = NULL;
+    for (unsigned int i = 0; i < WEBUI_ASSET_COUNT; i++) {
+      if (path.equals(WEBUI_ASSETS[i].path)) { a = &WEBUI_ASSETS[i]; break; }
+    }
+    if (a != NULL) {
+      String hdr = String("HTTP/1.1 200 OK\r\nContent-Type: ") + a->mime + "\r\n";
+      if (a->gz) hdr += "Content-Encoding: gzip\r\n";
+      hdr += "Content-Length: " + String(a->len) +
+             "\r\nConnection: close\r\n\r\n";
+      c.write((const uint8_t *)hdr.c_str(), hdr.length());
+      uint32_t off = 0;
+      while (off < a->len && c.connected()) {
+        uint32_t n = a->len - off;
+        if (n > 4096) n = 4096;
+        c.write(a->data + off, n);
+        off += n;
+      }
+    } else {
+      static const char nf[] =
+          "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n"
+          "Connection: close\r\n\r\nNot Found";
+      c.write((const uint8_t *)nf, sizeof(nf) - 1);
+    }
+  }
+  delay(2);   // let the response drain before close
+  c.stop();
+}
+
+// NOTE: webuiHttpPoll is defined BEFORE setup(): arduino-preprocessor
+// wraps functions defined between setup() and loop() in extern "C"
+// (ill-formed when combined with static -> proto parse error).
+//==========================================================
 // Handle Incoming Commands
 //==========================================================
 void handleCommand(String command) {
@@ -1833,61 +1891,6 @@ void setup() {
   // Send ready message
   sendResponse("[INFO] Evil-BW16 initialized and ready for commands.");
   sendResponse("[INFO] Type 'help' for available commands.");
-}
-
-//==========================================================
-// HTTP static asset server (:80) for the WebUI
-//==========================================================
-// Serves the embedded gzipped assets (webui_assets.h). Server socket is
-// non-blocking (setNonBlockingMode before begin) so available() returns
-// immediately; the bounded request read only runs once a client connects.
-static void webuiHttpPoll(void) {
-  WiFiClient c = httpServer.available();
-  if (!c.connected()) return;   // handles -1 -> 0xFF accept sentinel too
-  String req;
-  unsigned long t0 = millis();
-  bool got = false;
-  while (millis() - t0 < 1000) {
-    while (c.available()) {
-      char ch = (char)c.read();
-      req += ch;
-      if (req.endsWith("\r\n\r\n")) { got = true; break; }
-    }
-    if (got || !c.connected()) break;
-    delay(5);
-  }
-  if (got && req.startsWith("GET ")) {
-    int sp = req.indexOf(' ', 4);
-    String path = req.substring(4, (sp >= 0) ? sp : (int)req.length());
-    int q = path.indexOf('?');
-    if (q >= 0) path = path.substring(0, q);
-    if (path == "/") path = "/index.html";
-    const WebAsset *a = NULL;
-    for (unsigned int i = 0; i < WEBUI_ASSET_COUNT; i++) {
-      if (path.equals(WEBUI_ASSETS[i].path)) { a = &WEBUI_ASSETS[i]; break; }
-    }
-    if (a != NULL) {
-      String hdr = String("HTTP/1.1 200 OK\r\nContent-Type: ") + a->mime + "\r\n";
-      if (a->gz) hdr += "Content-Encoding: gzip\r\n";
-      hdr += "Content-Length: " + String(a->len) +
-             "\r\nConnection: close\r\n\r\n";
-      c.write((const uint8_t *)hdr.c_str(), hdr.length());
-      uint32_t off = 0;
-      while (off < a->len && c.connected()) {
-        uint32_t n = a->len - off;
-        if (n > 4096) n = 4096;
-        c.write(a->data + off, n);
-        off += n;
-      }
-    } else {
-      static const char nf[] =
-          "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n"
-          "Connection: close\r\n\r\nNot Found";
-      c.write((const uint8_t *)nf, sizeof(nf) - 1);
-    }
-  }
-  delay(2);   // let the response drain before close
-  c.stop();
 }
 
 //==========================================================
