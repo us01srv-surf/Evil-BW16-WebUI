@@ -1033,6 +1033,19 @@ static void webuiWsDispatch(ws_conn *conn, int data_len, enum opcode_type opcode
     handleCommand(command);
 }
 
+// Wake any previous ws_server thread parked in its 50 s select(): a loopback
+// connect makes the still-bound old listener readable, so it observes
+// ws_server_running==0, exits and releases port 81 (ws_server_stop is a flag
+// only - the thread notices at its next select return).
+static void webuiWakeWsSelect(void) {
+  WiFiClient probe;
+  probe.connect(IPAddress(127, 0, 0, 1), WEBUI_WS_PORT);   // loopback
+  probe.stop();
+  WiFiClient probe2;
+  probe2.connect(WiFi.localIP(), WEBUI_WS_PORT);           // AP route
+  probe2.stop();
+}
+
 // Start the WebUI WS server (idempotent). Used by 'webui on' and setup() auto-start.
 static bool webuiStart(void) {
   if (webuiRunning) return true;
@@ -1042,11 +1055,17 @@ static bool webuiStart(void) {
   // besides our loop()-task flusher - shrink the interleave window.
   ws_server_setup_ping_interval(3600000);  // 1 h (0 semantics unverified)
   ws_server_dispatch(webuiWsDispatch);
-  int wsret = ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
-                              WS_SERVER_SECURE_NONE);
-  if (wsret == 0) {
-    webuiRunning = true;
-    return true;
+  // Retry: if a previous server thread still holds :81 (its select can run
+  // up to 50 s), fail -> wake it via loopback probe -> let it exit -> retry.
+  for (int attempt = 0; attempt < 6; attempt++) {
+    int wsret = ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
+                                WS_SERVER_SECURE_NONE);
+    if (wsret == 0) {
+      webuiRunning = true;
+      return true;
+    }
+    webuiWakeWsSelect();
+    delay(500);
   }
   return false;
 }
