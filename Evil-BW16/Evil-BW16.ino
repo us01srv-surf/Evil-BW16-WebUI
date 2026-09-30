@@ -2005,6 +2005,16 @@ void setup() {
 // Main Loop
 //==========================================================
 void loop() {
+  // TEMP heartbeats: is loop cycling + why is retry not firing?
+  {
+    static uint32_t hbLast = 0;
+    if (wsRestartPending && (millis() - hbLast) >= 5000) {
+      hbLast = millis();
+      sendResponse("[HB] loop alive; pend=" + String(wsRestartPending) +
+                   " run=" + String(webuiRunning) +
+                   " sinceLastTry=" + String(millis() - wsRestartLastTry));
+    }
+  }
   // Deferred WS restart: retry ~1/s while the previous server thread still
   // holds :81 (its select can take up to 50 s to observe the stop flag).
   // Kept here - never inside restore - so loop() always keeps serving HTTP
@@ -2019,12 +2029,13 @@ void loop() {
       sendResponse("[INFO] WebUI WS restarted");
     } else {
       static uint8_t failCount = 0;
+      static uint32_t repLast = 0;
       wsFailErrno = errno;   // TEMP
       failCount++;
-      if (failCount % 10 == 0) {
-        sendResponse("[INFO] WS restart still failing, errno=" +
-                     String(wsFailErrno) + " after " +
-                     String(failCount) + " tries");
+      if (failCount % 10 == 0 || (millis() - repLast) >= 3000) {
+        repLast = millis();
+        sendResponse("[INFO] WS retry #" + String(failCount) +
+                     " errno=" + String(wsFailErrno));
       }
     }
   }
