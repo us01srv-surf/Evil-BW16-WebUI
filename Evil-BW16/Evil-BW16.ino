@@ -32,6 +32,7 @@
 #define NOMINMAX  // Prevent Windows min/max macros from interfering with STL
 #include <vector>
 #include <Arduino.h>
+#include <errno.h>   // TEMP: report lwip listen() errno on ws restart failure
 #include "wifi_conf.h"
 #include "wifi_util.h"
 #include "wifi_structures.h"
@@ -1043,6 +1044,7 @@ static void webuiWsDispatch(ws_conn *conn, int data_len, enum opcode_type opcode
 // sockets on failure - no fd leak on this path).
 static bool wsRestartPending = false;
 static uint32_t wsRestartLastTry = 0;
+static int wsFailErrno = 0;           // TEMP: errno right after ws_server_start fails
 
 // Start the WebUI WS server (idempotent). Used by 'webui on' and setup() auto-start.
 static bool webuiStart(void) {
@@ -1061,6 +1063,7 @@ static bool webuiStart(void) {
   }
   wsRestartPending = true;
   wsRestartLastTry = millis();
+  wsFailErrno = errno;   // TEMP: lwip set this via sock_set_errno during init
   return false;
 }
 
@@ -1120,7 +1123,7 @@ static void restoreApAndWebui(void) {
     if (webuiRunning) {
       msg += " (ws :" + String(WEBUI_WS_PORT) + ")";
     } else if (wsRestartPending) {
-      msg += " (ws restart pending, old server exits <=50 s)";
+      msg += " (ws restart pending, errno=" + String(wsFailErrno) + ")";
     }
     sendResponse(msg);
   } else {
@@ -2014,6 +2017,15 @@ void loop() {
       wsRestartPending = false;
       webuiRunning = true;
       sendResponse("[INFO] WebUI WS restarted");
+    } else {
+      static uint8_t failCount = 0;
+      wsFailErrno = errno;   // TEMP
+      failCount++;
+      if (failCount % 10 == 0) {
+        sendResponse("[INFO] WS restart still failing, errno=" +
+                     String(wsFailErrno) + " after " +
+                     String(failCount) + " tries");
+      }
     }
   }
   // WebUI WS flush - the SOLE socket writer for our output (root cause of
