@@ -1033,18 +1033,16 @@ static void webuiWsDispatch(ws_conn *conn, int data_len, enum opcode_type opcode
     handleCommand(command);
 }
 
-// Wake any previous ws_server thread parked in its 50 s select(): a loopback
-// connect makes the still-bound old listener readable, so it observes
-// ws_server_running==0, exits and releases port 81 (ws_server_stop is a flag
-// only - the thread notices at its next select return).
-static void webuiWakeWsSelect(void) {
-  WiFiClient probe;
-  probe.connect(IPAddress(127, 0, 0, 1), WEBUI_WS_PORT);   // loopback
-  probe.stop();
-  WiFiClient probe2;
-  probe2.connect(WiFi.localIP(), WEBUI_WS_PORT);           // AP route
-  probe2.stop();
-}
+// Deferred WS restart state: ws_server_stop() only sets a flag - the old
+// server thread notices at its next select() return (up to 50 s) and only
+// then releases port 81. WiFiClient::connect() has NO timeout (a blackholed
+// probe stalls loop() for tens of seconds - proven: webuiHttpPoll starved
+// while :80 answered TCP but never served), so never probe-wait here.
+// First attempt runs fast (bind fails instantly while :81 is held) and
+// loop() retries ~1/s until the old thread exits (init closes its own
+// sockets on failure - no fd leak on this path).
+static bool wsRestartPending = false;
+static uint32_t wsRestartLastTry = 0;
 
 // Start the WebUI WS server (idempotent). Used by 'webui on' and setup() auto-start.
 static bool webuiStart(void) {
@@ -1055,18 +1053,14 @@ static bool webuiStart(void) {
   // besides our loop()-task flusher - shrink the interleave window.
   ws_server_setup_ping_interval(3600000);  // 1 h (0 semantics unverified)
   ws_server_dispatch(webuiWsDispatch);
-  // Retry: if a previous server thread still holds :81 (its select can run
-  // up to 50 s), fail -> wake it via loopback probe -> let it exit -> retry.
-  for (int attempt = 0; attempt < 6; attempt++) {
-    int wsret = ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
-                                WS_SERVER_SECURE_NONE);
-    if (wsret == 0) {
-      webuiRunning = true;
-      return true;
-    }
-    webuiWakeWsSelect();
-    delay(500);
+  if (ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
+                      WS_SERVER_SECURE_NONE) == 0) {
+    webuiRunning = true;
+    wsRestartPending = false;
+    return true;
   }
+  wsRestartPending = true;
+  wsRestartLastTry = millis();
   return false;
 }
 
@@ -1100,17 +1094,35 @@ static void restoreApAndWebui(void) {
   int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
                               channelStr, HIDDEN_AP ? 1 : 0);
   if (apStatus == WL_CONNECTED) {
-    httpServer.setNonBlockingMode();
-    httpServer.begin();
-    if (wantWs && !webuiStart()) {
-      sendResponse("[ERROR] WebUI WS restart failed");
+    // start_server's bind can flake right after the cycle (old PCB not yet
+    // fully released - seen 2/3 in testing) and a failed begin leaks one
+    // unbound fd - bounded at 3 attempts. connected() == begin() success.
+    bool httpOk = false;
+    for (int a = 0; a < 3; a++) {
+      httpServer.stop();
+      httpServer.setNonBlockingMode();
+      httpServer.begin();
+      if (httpServer.connected()) {
+        httpOk = true;
+        break;
+      }
+      delay(200);
+    }
+    if (!httpOk) {
+      sendResponse("[ERROR] HTTP restore failed (bind :80)");
       return;
     }
+    if (wantWs) webuiStart();   // fast: ok -> running; held :81 -> pending
     IPAddress apIP = WiFi.localIP();
-    sendResponse("[INFO] AP restored. WebUI: http://" +
+    String msg = "[INFO] AP restored. WebUI: http://" +
                  String(apIP[0]) + "." + String(apIP[1]) + "." +
-                 String(apIP[2]) + "." + String(apIP[3]) +
-                 "/ (ws :" + String(WEBUI_WS_PORT) + ")");
+                 String(apIP[2]) + "." + String(apIP[3]) + "/";
+    if (webuiRunning) {
+      msg += " (ws :" + String(WEBUI_WS_PORT) + ")";
+    } else if (wsRestartPending) {
+      msg += " (ws restart pending, old server exits <=50 s)";
+    }
+    sendResponse(msg);
   } else {
     sendResponse("[ERROR] AP restore failed (WiFi.apbegin)");
   }
@@ -1738,11 +1750,14 @@ void handleCommand(String command) {
     } else if (webuiStart()) {
       sendResponse("[INFO] WebUI WS server started: ws://<device-ip>:" +
                    String(WEBUI_WS_PORT) + "/ws");
+    } else if (wsRestartPending) {
+      sendResponse("[INFO] WS port busy (old server exiting) - retrying in background");
     } else {
       sendResponse("[ERROR] ws_server_start failed");
     }
   }
   else if (command.equalsIgnoreCase("webui off")) {
+    wsRestartPending = false;   // cancel any deferred restart
     if (webuiRunning) {
       ws_server_stop();
       webuiRunning = false;
@@ -1972,7 +1987,10 @@ void setup() {
                  String(apIP[1]) + "." + String(apIP[2]) + "." +
                  String(apIP[3]) + "/ (ws :" + String(WEBUI_WS_PORT) + ")");
   } else {
-    sendResponse("[ERROR] WebUI WS auto-start failed");
+    // pending (loop() retries ~1/s) or hard failure - both reported below
+    sendResponse(wsRestartPending
+                     ? "[INFO] WebUI: http up, WS start deferred (retrying)"
+                     : "[ERROR] WebUI WS auto-start failed");
   }
 
   // Send ready message
@@ -1984,6 +2002,20 @@ void setup() {
 // Main Loop
 //==========================================================
 void loop() {
+  // Deferred WS restart: retry ~1/s while the previous server thread still
+  // holds :81 (its select can take up to 50 s to observe the stop flag).
+  // Kept here - never inside restore - so loop() always keeps serving HTTP
+  // and serial while the old thread winds down.
+  if (wsRestartPending && !webuiRunning &&
+      (millis() - wsRestartLastTry) >= 1000) {
+    wsRestartLastTry = millis();
+    if (ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
+                        WS_SERVER_SECURE_NONE) == 0) {
+      wsRestartPending = false;
+      webuiRunning = true;
+      sendResponse("[INFO] WebUI WS restarted");
+    }
+  }
   // WebUI WS flush - the SOLE socket writer for our output (root cause of
   // the old last-line-only bug is documented at the wsTxQ declaration).
   if (webuiRunning && wsTxQLen > 0) {
