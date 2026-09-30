@@ -33,6 +33,12 @@
 #include <vector>
 #include <Arduino.h>
 #include <errno.h>   // TEMP: report lwip listen() errno on ws restart failure
+extern "C" {
+int lwip_socket(int domain, int type, int protocol);
+int lwip_bind(int s, const void *name, int namelen);
+int lwip_listen(int s, int backlog);
+int lwip_close(int s);
+}
 #include "wifi_conf.h"
 #include "wifi_util.h"
 #include "wifi_structures.h"
@@ -1115,17 +1121,11 @@ static void restoreApAndWebui(void) {
       delay(300);
     }
     if (!httpOk) {
-      Serial.printf("[D0] begin-failed, errno=%d\r\n", lastErrno);
+      Serial.println(String("[D0] begin-failed, errno=") + lastErrno);
       // Phase-level raw probe: socket/bind/listen with per-call errno, to
       // find WHICH call returns what (WiFiServer collapses it all to begin()).
-      extern "C" {
-      int lwip_socket(int, int, int);
-      int lwip_bind(int, const void *, int);
-      int lwip_listen(int, int);
-      int lwip_close(int);
-      }
       int rfd = lwip_socket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
-      Serial.printf("[D1] raw fd=%d e_sock=%d\r\n", rfd, errno);
+      Serial.println(String("[D1] raw fd=") + rfd + " e_sock=" + errno);
       int rbn = -1, rln = -1, e_bind = 0, e_lstn = 0;
       if (rfd >= 0) {
         struct LwipSockAddrIn {   // lwip layout: u8 fam, u16 port, u32 addr, u8[8]
@@ -1140,15 +1140,15 @@ static void restoreApAndWebui(void) {
         ra.sin_addr = 0;                   // INADDR_ANY
         rbn = lwip_bind(rfd, &ra, sizeof(ra));
         e_bind = errno;
-        Serial.printf("[D2] bind=%d e_bind=%d\r\n", rbn, e_bind);
+        Serial.println(String("[D2] bind=") + rbn + " e_bind=" + e_bind);
         if (rbn == 0) {
           rln = lwip_listen(rfd, 1);
           e_lstn = errno;
-          Serial.printf("[D3] listen=%d e_listen=%d\r\n", rln, e_lstn);
+          Serial.println(String("[D3] listen=") + rln + " e_listen=" + e_lstn);
         }
         lwip_close(rfd);
       }
-      Serial.printf("[D4] probe done fd=%d bind=%d listen=%d\r\n", rfd, rbn, rln);
+      Serial.println(String("[D4] probe done fd=") + rfd + " bind=" + rbn + " listen=" + rln);
       sendResponse("[ERROR] HTTP restore failed (bind :80, errno=" +
                    String(lastErrno) + ")");
       return;
