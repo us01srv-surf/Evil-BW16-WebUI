@@ -1100,9 +1100,10 @@ static void restoreApAndWebui(void) {
   if (apStatus == WL_CONNECTED) {
     // start_server's bind can flake right after the cycle (old PCB not yet
     // fully released - seen 2/3 in testing) and a failed begin leaks one
-    // unbound fd - bounded at 3 attempts. connected() == begin() success.
+    // unbound fd - bounded at 5 attempts. connected() == begin() success.
     bool httpOk = false;
-    for (int a = 0; a < 3; a++) {
+    int lastErrno = 0;
+    for (int a = 0; a < 5; a++) {
       httpServer.stop();
       httpServer.setNonBlockingMode();
       httpServer.begin();
@@ -1110,10 +1111,19 @@ static void restoreApAndWebui(void) {
         httpOk = true;
         break;
       }
-      delay(200);
+      lastErrno = errno;
+      delay(300);
     }
     if (!httpOk) {
-      sendResponse("[ERROR] HTTP restore failed (bind :80)");
+      // Diagnostic: is a zombie listener holding :80, or was the bind
+      // failure transient? Loopback connect is instant either way
+      // (RST when free -> false; queued accept when zombie -> true).
+      WiFiClient p;
+      bool zombie = p.connect(IPAddress(127, 0, 0, 1), 80);
+      p.stop();
+      sendResponse("[ERROR] HTTP restore failed (bind :80, errno=" +
+                   String(lastErrno) + ", probe=" +
+                   (zombie ? "ZOMBIE-LISTENER" : "free") + ")");
       return;
     }
     IPAddress apIP = WiFi.localIP();
