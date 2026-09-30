@@ -33,9 +33,13 @@
 #include <vector>
 #include <Arduino.h>
 #include <errno.h>   // TEMP: report lwip listen() errno on ws restart failure
+// TEMP: raw lwip call declarations for the restore phase probe (ABI-compatible;
+// lwip headers don't compile cleanly inside the Arduino C++ TU).
 extern "C" {
-#define LWIP_COMPAT_SOCKETS 0   // no close/write/... macros that would mangle our code
-#include "lwip/sockets.h"       // TEMP: raw socket/bind/listen probe in restore diag
+int lwip_socket(int domain, int type, int protocol);
+int lwip_bind(int s, const void *name, int namelen);
+int lwip_listen(int s, int backlog);
+int lwip_close(int s);
 }
 #include "wifi_conf.h"
 #include "wifi_util.h"
@@ -1128,16 +1132,21 @@ static void restoreApAndWebui(void) {
       // Phase-level raw probe: socket/bind/listen with per-call errno, to
       // find WHICH call returns what (WiFiServer collapses it all to begin()).
       int e_sock = 0, e_bind = 0, e_lstn = 0;
-      int rfd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      int rfd = lwip_socket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
       e_sock = errno;
       int rbn = -1, rln = -1;
       if (rfd >= 0) {
-        struct sockaddr_in ra;
+        struct LwipSockAddrIn {   // lwip layout: u8 fam, u16 port, u32 addr, u8[8]
+          uint8_t sin_family;
+          uint16_t sin_port;
+          uint32_t sin_addr;
+          char sin_zero[8];
+        } ra;
         memset(&ra, 0, sizeof(ra));
-        ra.sin_family = AF_INET;
-        ra.sin_port = htons(80);
-        ra.sin_addr.s_addr = INADDR_ANY;
-        rbn = lwip_bind(rfd, (struct sockaddr *)&ra, sizeof(ra));
+        ra.sin_family = 2;                 // AF_INET
+        ra.sin_port = (uint16_t)((80 << 8) | (80 >> 8));  // htons(80)
+        ra.sin_addr = 0;                   // INADDR_ANY
+        rbn = lwip_bind(rfd, &ra, sizeof(ra));
         e_bind = errno;
         if (rbn == 0) {
           rln = lwip_listen(rfd, 1);
