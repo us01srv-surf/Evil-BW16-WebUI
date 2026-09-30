@@ -1074,13 +1074,14 @@ extern uint8_t arduino_wifi_mode_check;   // wifi_drv.cpp global (wifi_drv.h)
 static void restoreApAndWebui(void) {
   if (!apSuperseded) return;
   apSuperseded = false;
-  bool wantWs = webuiRunning;
-  // Release server sockets FIRST (frees the lwIP netconn pool).
-  if (wantWs) {
-    ws_server_stop();
-    webuiRunning = false;
-  }
-  httpServer.stop();
+  // v4: do NOT stop the WS server across the transform. Its listen PCB
+  // survives wifi_off/on (proven: post-restore listen() returns EADDRINUSE
+  // because the old PCB is still in tcp_listen_pcbs) and stopping it is a
+  // one-way door: the old thread's exit close()s the SHARED ws_server_sock
+  // global that our retries keep reusing -> the original fd leaks (netconn
+  // pool dies, ENOBUFS) and the parked thread never wakes to finish the job.
+  // Keep webuiRunning and the old server; it resumes when the netif returns.
+  httpServer.stop();   // HTTP IS re-created (WiFiServer has no such shared-state hazards)
   // The Arduino wifi layer caches init_wlan/wifi_mode in file-static vars we
   // can't reset - after a promisc transform + raw wifi_off its wifiDriverInit
   // no-ops and apbegin's ioctl hits a DOWN netif. The only reachable lever is
@@ -1115,16 +1116,12 @@ static void restoreApAndWebui(void) {
       sendResponse("[ERROR] HTTP restore failed (bind :80)");
       return;
     }
-    if (wantWs) webuiStart();   // fast: ok -> running; held :81 -> pending
     IPAddress apIP = WiFi.localIP();
     String msg = "[INFO] AP restored. WebUI: http://" +
                  String(apIP[0]) + "." + String(apIP[1]) + "." +
                  String(apIP[2]) + "." + String(apIP[3]) + "/";
-    if (webuiRunning) {
-      msg += " (ws :" + String(WEBUI_WS_PORT) + ")";
-    } else if (wsRestartPending) {
-      msg += " (ws restart pending, errno=" + String(wsFailErrno) + ")";
-    }
+    msg += webuiRunning ? " (ws :" + String(WEBUI_WS_PORT) + ", kept)"
+                        : " (ws not running)";
     sendResponse(msg);
   } else {
     sendResponse("[ERROR] AP restore failed (WiFi.apbegin)");
