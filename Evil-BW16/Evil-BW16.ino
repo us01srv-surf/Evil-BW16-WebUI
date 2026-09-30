@@ -1048,7 +1048,7 @@ static uint32_t wsRestartLastTry = 0;
 static bool webuiStart(void) {
   if (webuiRunning) return true;
   ws_server_setup_tx_rx_size(2048, 512);   // default 256B tx is too small
-  ws_server_setup_debug(WS_SERVER_DEBUG_OFF);
+  ws_server_setup_debug(WS_SERVER_DEBUG_VERBOSE);  // TEMP: diagnose deferred-restart failures
   // SDK ping (conn task, 2B/30s default) is the only other socket writer
   // besides our loop()-task flusher - shrink the interleave window.
   ws_server_setup_ping_interval(3600000);  // 1 h (0 semantics unverified)
