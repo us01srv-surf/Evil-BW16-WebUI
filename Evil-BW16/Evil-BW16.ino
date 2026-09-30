@@ -33,6 +33,10 @@
 #include <vector>
 #include <Arduino.h>
 #include <errno.h>   // TEMP: report lwip listen() errno on ws restart failure
+extern "C" {
+#define LWIP_COMPAT_SOCKETS 0   // no close/write/... macros that would mangle our code
+#include "lwip/sockets.h"       // TEMP: raw socket/bind/listen probe in restore diag
+}
 #include "wifi_conf.h"
 #include "wifi_util.h"
 #include "wifi_structures.h"
@@ -1121,9 +1125,32 @@ static void restoreApAndWebui(void) {
       WiFiClient p;
       bool zombie = p.connect(IPAddress(127, 0, 0, 1), 80);
       p.stop();
+      // Phase-level raw probe: socket/bind/listen with per-call errno, to
+      // find WHICH call returns what (WiFiServer collapses it all to begin()).
+      int e_sock = 0, e_bind = 0, e_lstn = 0;
+      int rfd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      e_sock = errno;
+      int rbn = -1, rln = -1;
+      if (rfd >= 0) {
+        struct sockaddr_in ra;
+        memset(&ra, 0, sizeof(ra));
+        ra.sin_family = AF_INET;
+        ra.sin_port = htons(80);
+        ra.sin_addr.s_addr = INADDR_ANY;
+        rbn = lwip_bind(rfd, (struct sockaddr *)&ra, sizeof(ra));
+        e_bind = errno;
+        if (rbn == 0) {
+          rln = lwip_listen(rfd, 1);
+          e_lstn = errno;
+        }
+        lwip_close(rfd);
+      }
       sendResponse("[ERROR] HTTP restore failed (bind :80, errno=" +
                    String(lastErrno) + ", probe=" +
                    (zombie ? "ZOMBIE-LISTENER" : "free") + ")");
+      sendResponse("[DIAG] raw fd=" + String(rfd) + " e_sock=" + String(e_sock) +
+                   " bind=" + String(rbn) + " e_bind=" + String(e_bind) +
+                   " listen=" + String(rln) + " e_listen=" + String(e_lstn));
       return;
     }
     IPAddress apIP = WiFi.localIP();
