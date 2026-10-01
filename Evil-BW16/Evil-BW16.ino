@@ -94,7 +94,15 @@ static bool webuiRunning = false;
 // writer and uses direct_sendText (own buffer, immediate write).
 static char wsTxQ[4096];                 // pending bytes (drop-on-full)
 static volatile uint32_t wsTxQLen = 0;
-static char wsTxOut[4096];               // flush scratch (single-threaded: loop)
+static char wsTxOut[4096];               // flush scratch (flush task only)
+// (e) reply-only WS output: only the conn that sent the last command gets the
+// response burst. Broadcasting to every conn targeted zombies (pre-transform
+// peers whose FIN was lost) -> SDK sendData retried EAGAIN with no attempt
+// limit -> wedged the writer task, and when that was loop(), serial+HTTP too.
+// Store the SOCK FD only, never a ws_conn*: conn_remove memsets/frees table
+// entries so a cached pointer dangles. The flusher re-resolves the fd in the
+// live conn table each burst; -1 = no target -> discard the burst.
+static volatile int wsReplySock = -1;
 WiFiServer httpServer(80);               // WebUI static asset server (global: _portMode zero-init = TCP)
 // Single-radio truth: wifi_on(PROMISC) supersedes the AP (beacons stop, netif
 // and the :80/:81 listeners die). Set whenever that happens; cleared when the
@@ -459,6 +467,7 @@ void setChannel(int newChannel) {
   if (!isSniffing) {
     // Need to initialize WiFi first
     apSuperseded = true;
+    wsReplySock = -1;   // transform kills conns -> reply target gone
     wifi_on(RTW_MODE_PROMISC);
     wifi_enter_promisc_mode();
   }
@@ -514,6 +523,7 @@ void startSniffing() {
 
     // Initialize WiFi in PROMISC mode
     apSuperseded = true;
+    wsReplySock = -1;
     wifi_on(RTW_MODE_PROMISC);
     wifi_enter_promisc_mode();
     setChannel(currentChannel);
@@ -1039,6 +1049,7 @@ static void webuiWsDispatch(ws_conn *conn, int data_len, enum opcode_type opcode
     if (command.length() == 0) {
         return;
     }
+    wsReplySock = conn->sock;   // (e) responses go back only to this conn
     handleCommand(command);
 }
 
@@ -1054,8 +1065,91 @@ static bool wsRestartPending = false;
 static uint32_t wsRestartLastTry = 0;
 static int wsFailErrno = 0;           // TEMP: errno right after ws_server_start fails
 
+// (e)+(c) Reply-only flush of wsTxQ, run ONLY from wsFlushTask (a dedicated
+// FreeRTOS task) - never from loop(). If direct_sendText ever wedges (SDK
+// sendData retries EAGAIN with no attempt limit on a dead peer), only this
+// task stalls: serial + HTTP keep serving, so the E2E serial_alive probe
+// survives even in the worst case. Reply-only means a zombie conn (pre-sniff
+// peer whose FIN was lost) is never targeted, so the wedge shouldn't occur.
+static void wsFlushOnce(void) {
+  uint32_t n;
+  rtw_enter_critical(NULL, NULL);
+  n = wsTxQLen;
+  memcpy(wsTxOut, wsTxQ, n);   // sizes equal (4096) -> n never exceeds
+  wsTxQLen = 0;
+  rtw_exit_critical(NULL, NULL);
+
+  // Resolve the reply target by sock fd against the LIVE table each call.
+  // Never cache a ws_conn*: conn_remove memsets/frees entries, so a held
+  // pointer dangles (use-after-free was mechanism (c) in DeepSeek round 3).
+  ws_conn *target = NULL;
+  int want = wsReplySock;
+  if (want >= 0) {
+    for (int i = 0; i < WEBUI_WS_MAXCONN; i++) {
+      ws_conn *c = ws_server_get_conn_info(i);
+      if (c != NULL && c->sock == want &&
+          (c->state == CONNECTED1 || c->state == CONNECTED2)) {
+        target = c;
+        break;
+      }
+    }
+  }
+  if (target == NULL) {
+    return;   // no valid target -> discard (no stale backlog, no zombie send)
+  }
+
+  // UI processMessage expects JSON: wrap each line as
+  // {"type":"serial_data","message":"<escaped>"}. One frame per line
+  // keeps every frame far below the 2048B tx limit even after escaping.
+  uint32_t start = 0;
+  for (uint32_t i = 0; i <= n; i++) {
+    if (i != n && wsTxOut[i] != '\n') continue;
+    uint32_t len = i - start;
+    if (len > 0) {
+      String frame;
+      frame.reserve(len + 48);
+      frame = "{\"type\":\"serial_data\",\"message\":\"";
+      for (uint32_t j = 0; j < len && frame.length() < 1800; j++) {
+        unsigned char ch = (unsigned char)wsTxOut[start + j];
+        if (ch == '"')            frame += "\\\"";
+        else if (ch == '\\')      frame += "\\\\";
+        else if (ch == '\n')      frame += "\\n";
+        else if (ch == '\r')      frame += "\\r";
+        else if (ch == '\t')      frame += "\\t";
+        else if (ch < 0x20)       { char t[8]; snprintf(t, sizeof(t), "\\u%04x", ch); frame += t; }
+        else                      frame += (char)ch;
+      }
+      frame += "\"}";
+      // direct_sendText takes char* (non-const); it memcpy's to its own
+      // txbufs, so casting the const away is safe here.
+      ws_server_direct_sendText((char *)frame.c_str(), (int)frame.length(), 0, target);
+    }
+    start = i + 1;
+  }
+}
+
+static void wsFlushTask(void *arg) {
+  (void)arg;
+  for (;;) {
+    if (webuiRunning && wsTxQLen > 0) {
+      wsFlushOnce();
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 // Start the WebUI WS server (idempotent). Used by 'webui on' and setup() auto-start.
 static bool webuiStart(void) {
+  static bool flushTaskCreated = false;
+  if (!flushTaskCreated) {
+    // Created once, regardless of start success - loop()'s deferred retry
+    // path sets webuiRunning later and must find the flusher already alive.
+    // xTaskCreate stack depth is in WORDS (portmacro: StackType_t=uint32_t):
+    // 1024 words = 4096 B, same as the SDK's own ws conn tasks.
+    if (xTaskCreate(wsFlushTask, "wsFlush", 1024, NULL, 1, NULL) == pdPASS) {
+      flushTaskCreated = true;
+    }
+  }
   if (webuiRunning) return true;
   ws_server_setup_tx_rx_size(2048, 512);   // default 256B tx is too small
   ws_server_setup_debug(WS_SERVER_DEBUG_VERBOSE);  // TEMP: diagnose deferred-restart failures
@@ -1446,6 +1540,7 @@ void handleCommand(String command) {
     isHopping = true;
     if (!isSniffing) {
       apSuperseded = true;
+      wsReplySock = -1;
       wifi_on(RTW_MODE_PROMISC);
       wifi_enter_promisc_mode();
     }
@@ -1854,6 +1949,7 @@ void handleCommand(String command) {
       rtw_enter_critical(NULL, NULL);
       wsTxQLen = 0;   // discard queued output - don't leak into next session
       rtw_exit_critical(NULL, NULL);
+      wsReplySock = -1;
       sendResponse("[INFO] WebUI WS server stopped");
     } else {
       sendResponse("[INFO] WebUI WS server is not running");
@@ -2126,59 +2222,9 @@ void loop() {
       }
     }
   }
-  // WebUI WS flush - the SOLE socket writer for our output (root cause of
-  // the old last-line-only bug is documented at the wsTxQ declaration).
-  if (webuiRunning && wsTxQLen > 0) {
-    uint32_t n;
-    rtw_enter_critical(NULL, NULL);
-    n = wsTxQLen;
-    memcpy(wsTxOut, wsTxQ, n);   // sizes equal (4096) -> n never exceeds
-    wsTxQLen = 0;
-    rtw_exit_critical(NULL, NULL);
-
-    ws_conn *conns[WEBUI_WS_MAXCONN];
-    int nc = 0;
-    for (int i = 0; i < WEBUI_WS_MAXCONN; i++) {
-      ws_conn *c = ws_server_get_conn_info(i);
-      if (c != NULL && (c->state == CONNECTED1 || c->state == CONNECTED2)) {
-        conns[nc++] = c;
-      }
-    }
-    if (nc > 0) {
-      // UI processMessage expects JSON: wrap each line as
-      // {"type":"serial_data","message":"<escaped>"}. One frame per line
-      // keeps every frame far below the 2048B tx limit even after escaping.
-      uint32_t start = 0;
-      for (uint32_t i = 0; i <= n; i++) {
-        if (i != n && wsTxOut[i] != '\n') continue;
-        uint32_t len = i - start;
-        if (len > 0) {
-          String frame;
-          frame.reserve(len + 48);
-          frame = "{\"type\":\"serial_data\",\"message\":\"";
-          for (uint32_t j = 0; j < len && frame.length() < 1800; j++) {
-            unsigned char ch = (unsigned char)wsTxOut[start + j];
-            if (ch == '"')            frame += "\\\"";
-            else if (ch == '\\')      frame += "\\\\";
-            else if (ch == '\n')      frame += "\\n";
-            else if (ch == '\r')      frame += "\\r";
-            else if (ch == '\t')      frame += "\\t";
-            else if (ch < 0x20)       { char t[8]; snprintf(t, sizeof(t), "\\u%04x", ch); frame += t; }
-            else                      frame += (char)ch;
-          }
-          frame += "\"}";
-          for (int k = 0; k < nc; k++) {
-            // direct_sendText takes char* (non-const); it memcpy's to its
-            // own txbufs, so casting the const away is safe here.
-            ws_server_direct_sendText((char *)frame.c_str(), (int)frame.length(), 0, conns[k]);
-          }
-        }
-        start = i + 1;
-      }
-    }
-    // no connected client -> discard (no stale backlog, matches ESP32
-    // sendUartDataToClients skip when ws.count()==0)
-  }
+  // WebUI WS flush moved out of loop(): wsFlushTask (own FreeRTOS task) is
+  // the sole socket writer now - a wedged direct_sendText can no longer
+  // stall serial/HTTP (this was the E2E serial_alive=False killer).
 
   // WebUI HTTP static server (bounded work: returns immediately when idle)
   webuiHttpPoll();
