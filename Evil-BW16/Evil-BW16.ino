@@ -1153,9 +1153,13 @@ static bool webuiStart(void) {
   if (webuiRunning) return true;
   ws_server_setup_tx_rx_size(2048, 512);   // default 256B tx is too small
   ws_server_setup_debug(WS_SERVER_DEBUG_VERBOSE);  // TEMP: diagnose deferred-restart failures
-  // SDK ping (conn task, 2B/30s default) is the only other socket writer
-  // besides our loop()-task flusher - shrink the interleave window.
-  ws_server_setup_ping_interval(3600000);  // 1 h (0 semantics unverified)
+  // SDK ping doubles as the DEAD-PEER REAPER: server pings -> state
+  // CONNECTED2 -> no pong within interval -> WSS_NOT_GET_PONG -> conn_remove.
+  // We previously used 1 h to minimize interleaves with our flusher, but a
+  // client that vanishes without FIN (host leaves the AP during sniff) then
+  // held a WS slot hostage -> 429 Too Many Requests for the next client
+  // (seen on hardware: both slots zombie after sniff). 15 s reap window.
+  ws_server_setup_ping_interval(15000);
   ws_server_dispatch(webuiWsDispatch);
   if (ws_server_start(WEBUI_WS_PORT, WEBUI_WS_MAXCONN, 4096,
                       WS_SERVER_SECURE_NONE) == 0) {
