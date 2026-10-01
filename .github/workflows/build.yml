@@ -25,6 +25,16 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install realtek:AmebaD
 
+      - name: Raise lwIP TCP PCB pools (TIME_WAIT holds MEMP_NUM_TCP_PCB=10;
+          ~12 short-lived HTTP/WS conns in TIME_WAIT exhaust it -> tcp_new
+          fails -> server bind gets EINVAL and restore dies)
+        run: |
+          OPTS=$(find ~/.arduino15/packages/realtek -name lwipopts.h -path '*api/network*' | head -1)
+          echo "patching $OPTS"
+          sed -i -E 's/^#define MEMP_NUM_TCP_PCB[[:space:]]+10$/#define MEMP_NUM_TCP_PCB        32/' "$OPTS"
+          sed -i -E 's/^#define MEMP_NUM_TCP_PCB_LISTEN[[:space:]]+5$/#define MEMP_NUM_TCP_PCB_LISTEN 8/' "$OPTS"
+          grep -n 'define MEMP_NUM_TCP_PCB' "$OPTS"
+
       - name: Compile Evil-BW16 sketch
         run: |
           arduino-cli compile \
