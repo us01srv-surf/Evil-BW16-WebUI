@@ -139,12 +139,13 @@ A powerful WiFi deauthentication tool running on BW16 and ESP32 platforms, featu
 
 ## Web Interface Usage 💡
 
-1. **Power on** the device (BW16 + ESP32).
+1. **Power on** the device (BW16 or ESP32).
 2. **Connect to the WiFi access point**:  
    - **SSID**: `Evil-BW16`  
-   - **Password**: `password1234`
+   - **Password**: `evilbw16` (BW16 firmware) / `password1234` (ESP32 sketch)
 3. Open a web browser and navigate to:  
-   `http://192.168.4.1`
+   - BW16: `http://192.168.1.1` (HTTP UI; WebSocket on port `81`)  
+   - ESP32: `http://192.168.4.1`
 4. **Access and control** the interface to:
    - **Scan** for networks
    - **Select** AP/clients as targets
@@ -160,7 +161,8 @@ A powerful WiFi deauthentication tool running on BW16 and ESP32 platforms, featu
 Configuration is primarily handled in **ESP32.ino** through hardcoded constants.
 
 ```cpp
-// Access Point Credentials
+// Access Point Credentials (ESP32 sketch - the BW16 firmware uses
+// "Evil-BW16" / "evilbw16", see Evil-BW16/Evil-BW16.ino WIFI_SSID/WIFI_PASS)
 const char* ap_ssid     = "Evil-BW16";
 const char* ap_password = "password1234";
 
@@ -280,7 +282,7 @@ Below is the repository layout:
 ### 2. Web Interface Not Loading
 
 - Confirm you are connected to the **Evil-BW16** SSID.
-- Verify the **IP address** is `192.168.4.1`.
+- Verify the **IP address** is `192.168.1.1` (BW16) or `192.168.4.1` (ESP32).
 - Try clearing your **browser cache** or use a different browser.
 
 ### 3. SD Card Not Detected (ESP32)
