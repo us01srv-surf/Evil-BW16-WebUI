@@ -31,9 +31,11 @@ jobs:
         run: |
           OPTS=$(find ~/.arduino15/packages/realtek -name lwipopts.h -path '*api/network*' | head -1)
           echo "patching $OPTS"
-          sed -i -E 's/^#define MEMP_NUM_TCP_PCB[[:space:]]+10$/#define MEMP_NUM_TCP_PCB        32/' "$OPTS"
-          sed -i -E 's/^#define MEMP_NUM_TCP_PCB_LISTEN[[:space:]]+5$/#define MEMP_NUM_TCP_PCB_LISTEN 8/' "$OPTS"
+          sed -i -E 's/^#define MEMP_NUM_TCP_PCB[[:space:]]+[0-9]+/\#define MEMP_NUM_TCP_PCB        32/' "$OPTS"
+          sed -i -E 's/^#define MEMP_NUM_TCP_PCB_LISTEN[[:space:]]+[0-9]+/\#define MEMP_NUM_TCP_PCB_LISTEN 8/' "$OPTS"
           grep -n 'define MEMP_NUM_TCP_PCB' "$OPTS"
+          grep -q 'MEMP_NUM_TCP_PCB        32' "$OPTS" || { echo 'SED FAILED: pool not raised'; exit 1; }
+          grep -q 'MEMP_NUM_TCP_PCB_LISTEN 8' "$OPTS" || { echo 'SED FAILED: listen pool not raised'; exit 1; }
 
       - name: Compile Evil-BW16 sketch
         run: |
