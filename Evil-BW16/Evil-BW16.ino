@@ -38,6 +38,8 @@ int lwip_socket(int domain, int type, int protocol);
 int lwip_bind(int s, const void *name, int namelen);
 int lwip_listen(int s, int backlog);
 int lwip_close(int s);
+int lwip_setsockopt(int s, int level, int optname, const void *optval,
+                    unsigned int optlen);   // socklen_t == u32 == unsigned
 }
 #include "wifi_conf.h"
 #include "wifi_util.h"
@@ -1104,6 +1106,83 @@ static void restoreApAndWebui(void) {
   int apStatus = WiFi.apbegin((char *)WIFI_SSID, (char *)WIFI_PASS,
                               channelStr, HIDDEN_AP ? 1 : 0);
   if (apStatus == WL_CONNECTED) {
+    // ---- staged raw bind diagnosis (runs once, BEFORE the retry loop) ----
+    // lwip sockaddr_in layout: len@0, family@1, port@2, addr@4, zero@8 (16B)
+    // — NOT the BSD no-len layout; family at offset 1 or validation reads
+    // AF_UNSPEC and returns EINVAL before do_bind. errno is global across
+    // FreeRTOS tasks here (kept WS thread also writes it) so each value is
+    // captured immediately after its own call.
+    struct LwSA {
+      uint8_t sin_len;
+      uint8_t sin_family;
+      uint16_t sin_port;
+      uint32_t sin_addr;
+      char sin_zero[8];
+    };
+    static_assert(sizeof(LwSA) == 16, "lwip sockaddr_in must be 16 bytes");
+
+    // [DA] plain bind :80 + listen — exactly what start_server does.
+    //   bind=0              → :80 free; WiFiServer's own failure is elsewhere
+    //   be=98 EADDRINUSE    → port held: check [DB] to classify (TW vs live)
+    //   be=107              → do_bind fatal last_err (conn corruption)
+    //   fd=-1/se=105        → netconn pool exhausted (failed begins leak fds)
+    errno = 0;
+    int da_fd = lwip_socket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
+    int da_se = errno;
+    LwSA da; memset(&da, 0, sizeof(da));
+    da.sin_family = 2;                                  // AF_INET
+    da.sin_port = (uint16_t)((80 << 8) | (80 >> 8));    // htons(80)
+    int da_bind = -999, da_be = 0, da_lstn = -999, da_le = 0;
+    if (da_fd >= 0) {
+      errno = 0;
+      da_bind = lwip_bind(da_fd, &da, sizeof(da));
+      da_be = errno;
+      if (da_bind == 0) {
+        errno = 0;
+        da_lstn = lwip_listen(da_fd, 1);
+        da_le = errno;
+      }
+      lwip_close(da_fd);   // close resets errno=0 on success — read values above first
+    }
+    Serial.println(String("[DA] plain80 fd=") + da_fd + " se=" + da_se +
+                   " bind=" + da_bind + " be=" + da_be +
+                   " listen=" + da_lstn + " le=" + da_le);
+
+    // [DB] SO_REUSEADDR bind :80 — skips the TIME_WAIT scan in tcp_bind.
+    //   bind=0 with [DA] be=98 → TIME_WAIT PCBs from prior HTTP conns = cause
+    //   bind=-1 with be=98     → a LIVE listener/bound/active pcb holds :80
+    errno = 0;
+    int db_fd = lwip_socket(2, 1, 6);
+    LwSA db; memset(&db, 0, sizeof(db));
+    db.sin_family = 2;
+    db.sin_port = (uint16_t)((80 << 8) | (80 >> 8));
+    int yes = 1;
+    if (db_fd >= 0) {
+      lwip_setsockopt(db_fd, 0xfff /*SOL_SOCKET*/, 0x0004 /*SO_REUSEADDR*/,
+                      &yes, sizeof(yes));
+    }
+    errno = 0;
+    int db_bind = (db_fd >= 0) ? lwip_bind(db_fd, &db, sizeof(db)) : -1;
+    int db_be = errno;
+    if (db_fd >= 0) lwip_close(db_fd);
+    Serial.println(String("[DB] reuse80 fd=") + db_fd +
+                   " bind=" + db_bind + " be=" + db_be);
+
+    // [DC] control: plain bind :8080 (never used by this firmware).
+    //   bind=0 → stack/netif healthy, problem is port-80-specific
+    //   bind=-1 → general lwip/netif state problem after the transform
+    errno = 0;
+    int dc_fd = lwip_socket(2, 1, 6);
+    LwSA dc; memset(&dc, 0, sizeof(dc));
+    dc.sin_family = 2;
+    dc.sin_port = (uint16_t)((8080 << 8) | (8080 >> 8));  // htons(8080)
+    errno = 0;
+    int dc_bind = (dc_fd >= 0) ? lwip_bind(dc_fd, &dc, sizeof(dc)) : -1;
+    int dc_be = errno;
+    if (dc_fd >= 0) lwip_close(dc_fd);
+    Serial.println(String("[DC] plain8080 fd=") + dc_fd +
+                   " bind=" + dc_bind + " be=" + dc_be);
+
     // start_server's bind can flake right after the cycle (old PCB not yet
     // fully released - seen 2/3 in testing) and a failed begin leaks one
     // unbound fd - bounded at 5 attempts. connected() == begin() success.
@@ -1113,42 +1192,16 @@ static void restoreApAndWebui(void) {
       httpServer.stop();
       httpServer.setNonBlockingMode();
       httpServer.begin();
+      int eBeg = errno;   // capture immediately — global errno races with WS thread
       if (httpServer.connected()) {
         httpOk = true;
         break;
       }
-      lastErrno = errno;
+      lastErrno = eBeg;
       delay(300);
     }
     if (!httpOk) {
-      Serial.println(String("[D0] begin-failed, errno=") + lastErrno);
-      // Phase-level raw probe: socket/bind/listen with per-call errno, to
-      // find WHICH call returns what (WiFiServer collapses it all to begin()).
-      int rfd = lwip_socket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
-      Serial.println(String("[D1] raw fd=") + rfd + " e_sock=" + errno);
-      int rbn = -1, rln = -1, e_bind = 0, e_lstn = 0;
-      if (rfd >= 0) {
-        struct LwipSockAddrIn {   // lwip layout: u8 fam, u16 port, u32 addr, u8[8]
-          uint8_t sin_family;
-          uint16_t sin_port;
-          uint32_t sin_addr;
-          char sin_zero[8];
-        } ra;
-        memset(&ra, 0, sizeof(ra));
-        ra.sin_family = 2;                 // AF_INET
-        ra.sin_port = (uint16_t)((80 << 8) | (80 >> 8));  // htons(80)
-        ra.sin_addr = 0;                   // INADDR_ANY
-        rbn = lwip_bind(rfd, &ra, sizeof(ra));
-        e_bind = errno;
-        Serial.println(String("[D2] bind=") + rbn + " e_bind=" + e_bind);
-        if (rbn == 0) {
-          rln = lwip_listen(rfd, 1);
-          e_lstn = errno;
-          Serial.println(String("[D3] listen=") + rln + " e_listen=" + e_lstn);
-        }
-        lwip_close(rfd);
-      }
-      Serial.println(String("[D4] probe done fd=") + rfd + " bind=" + rbn + " listen=" + rln);
+      Serial.println(String("[D0] begin-failed, lastErrno=") + lastErrno);
       sendResponse("[ERROR] HTTP restore failed (bind :80, errno=" +
                    String(lastErrno) + ")");
       return;

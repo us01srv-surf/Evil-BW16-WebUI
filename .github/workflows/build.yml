@@ -37,6 +37,26 @@ jobs:
           grep -q 'MEMP_NUM_TCP_PCB        32' "$OPTS" || { echo 'SED FAILED: pool not raised'; exit 1; }
           grep -q 'MEMP_NUM_TCP_PCB_LISTEN 8' "$OPTS" || { echo 'SED FAILED: listen pool not raised'; exit 1; }
 
+      - name: SO_REUSEADDR in start_server (short-lived HTTP conns leave TIME_WAIT
+          PCBs on :80 which survive the sniff/restore netif cycle and make tcp_bind
+          return ERR_USE -> 'ERROR on binding'; reuseaddr skips the TW scan but
+          still rejects live listeners)
+        run: |
+          SRC=$(find ~/.arduino15/packages/realtek -name ard_socket.c | head -1)
+          echo "patching $SRC"
+          python3 - "$SRC" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          anchor = "    localHost.sin_addr.s_addr = INADDR_ANY;"
+          inject = anchor + "\n    { int _yes = 1; setsockopt(_sock, SOL_SOCKET, SO_REUSEADDR, &_yes, sizeof(_yes)); } // CI: tolerate TIME_WAIT on rebind"
+          n = s.count(anchor)
+          assert n == 1, "anchor count=%d" % n
+          open(p, "w").write(s.replace(anchor, inject))
+          print("patched SO_REUSEADDR into start_server")
+          EOF
+          grep -n "SO_REUSEADDR" "$SRC"
+
       - name: Compile Evil-BW16 sketch
         run: |
           arduino-cli compile \
